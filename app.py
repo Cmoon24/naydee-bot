@@ -70,9 +70,14 @@ def handle_message(event):
         reply = "ขออภัยครับ ขณะนี้ระบบประมวลผลขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง"
 
     try:
+        # LINE limits text messages to 5000 characters. Split the reply into chunks of 4900 characters.
+        limit = 4900
+        messages = [TextSendMessage(text=reply[i:i+limit]) for i in range(0, len(reply), limit)]
+        
+        # LINE only allows up to 5 messages per reply token
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=reply)
+            messages[:5]
         )
     except Exception as e:
         logger.error(f"Line Reply Error: {e}")
