@@ -55,12 +55,13 @@ def handle_message(event):
     user_message = event.message.text
     
     try:
+        max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 8192))
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=user_message,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
-                max_output_tokens=1000,
+                max_output_tokens=max_tokens,
             ),
         )
         reply = response.text
