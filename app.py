@@ -10,6 +10,8 @@ from google import genai
 from google.genai import types
 import os
 import logging
+import time
+from collections import defaultdict
 from dotenv import load_dotenv
 
 # ตั้งค่า Logging
@@ -31,6 +33,37 @@ if not all([line_access_token, line_secret, gemini_api_key]):
 line_bot_api = LineBotApi(line_access_token)
 handler = WebhookHandler(line_secret)
 gemini_client = genai.Client(api_key=gemini_api_key)
+
+# In-memory storage to track user request timestamps: {user_id: [timestamp1, timestamp2, ...]}
+user_request_timestamps = defaultdict(list)
+
+# Limits to save tokens and prevent billing abuse
+RATE_LIMIT_PER_MINUTE = 5
+RATE_LIMIT_PER_DAY = 50
+
+def is_rate_limited(user_id):
+    if not user_id:
+        return False, ""
+        
+    now = time.time()
+    timestamps = user_request_timestamps[user_id]
+    
+    # Filter out timestamps older than 24 hours (86400 seconds)
+    timestamps = [t for t in timestamps if now - t < 86400]
+    user_request_timestamps[user_id] = timestamps
+    
+    # Check daily limit
+    if len(timestamps) >= RATE_LIMIT_PER_DAY:
+        return True, "ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน (50 ครั้ง/วัน) แล้ว กรุณาลองใหม่ในวันพรุ่งนี้ครับ 🙏"
+        
+    # Check minute limit (60 seconds)
+    recent_minute = [t for t in timestamps if now - t < 60]
+    if len(recent_minute) >= RATE_LIMIT_PER_MINUTE:
+        return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️"
+        
+    # Add current timestamp
+    user_request_timestamps[user_id].append(now)
+    return False, ""
 
 SYSTEM_PROMPT = """คุณคือ "นายดี" ผู้ช่วยด้านกฎหมายไทย
 เชี่ยวชาญเรื่องสิทธิ์ของประชาชนไทยทั่วไป
@@ -110,8 +143,21 @@ def handle_message(event):
             logger.error(f"Line Reply Welcome Error: {e}")
         return
 
+    # Check rate limits per user to prevent API spam and save token billing
+    user_id = event.source.user_id
+    limited, limit_message = is_rate_limited(user_id)
+    if limited:
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=limit_message)
+            )
+        except Exception as e:
+            logger.error(f"Line Reply Rate Limit Error: {e}")
+        return
+
     try:
-        max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 8192))
+        max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 1500))
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=user_message,
