@@ -3,7 +3,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     QuickReply, QuickReplyButton, MessageAction,
-    FollowEvent
+    FollowEvent, PostbackEvent, PostbackAction
 )
 from linebot.exceptions import InvalidSignatureError
 from google import genai
@@ -11,8 +11,10 @@ from google.genai import types
 import os
 import logging
 import time
+import json
 from collections import defaultdict
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 # ตั้งค่า Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,10 +38,17 @@ gemini_client = genai.Client(api_key=gemini_api_key)
 
 # In-memory storage to track user request timestamps: {user_id: [timestamp1, timestamp2, ...]}
 user_request_timestamps = defaultdict(list)
+# In-memory storage to cache the last full answer for each user: {user_id: full_answer}
+user_last_response = {}
 
 # Limits to save tokens and prevent billing abuse
 RATE_LIMIT_PER_MINUTE = 5
 RATE_LIMIT_PER_DAY = 50
+
+# Schema for Gemini structured JSON response
+class LegalResponse(BaseModel):
+    summary: str = Field(description="สรุปคำตอบแบบย่อสั้นๆ กระชับ เข้าใจง่าย บอก action plan ชัดเจนทีละขั้น มี disclaimer ท้ายคำตอบ")
+    full: str = Field(description="รายละเอียดคำตอบแบบเต็ม ครบถ้วนตามข้อกฎหมาย มีขั้นตอนการดำเนินการ และ disclaimer ท้ายคำตอบ")
 
 def is_rate_limited(user_id):
     if not user_id:
@@ -94,6 +103,26 @@ WELCOME_MESSAGE = """สวัสดีครับ! ผมนายดี 👋
 ผู้ช่วยด้านกฎหมายไทยที่พูดภาษาคนธรรมดา
 
 พิมพ์ปัญหาของคุณได้เลย หรือเลือกหัวข้อที่เจอบ่อยด้านล่างครับ 👇"""
+
+def send_split_messages(reply_token, text, quick_reply=None):
+    """
+    LINE limits text messages to 5000 characters. 
+    Split the response into chunks of 4900 characters and send them.
+    The quick reply is attached only to the last chunk.
+    """
+    try:
+        limit = 4900
+        chunks = [text[i:i+limit] for i in range(0, len(text), limit)][:5]
+        messages = []
+        for idx, chunk in enumerate(chunks):
+            if idx == len(chunks) - 1 and quick_reply:
+                messages.append(TextSendMessage(text=chunk, quick_reply=quick_reply))
+            else:
+                messages.append(TextSendMessage(text=chunk))
+        
+        line_bot_api.reply_message(reply_token, messages)
+    except Exception as e:
+        logger.error(f"Line Reply Error: {e}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -164,30 +193,70 @@ def handle_message(event):
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                response_schema=LegalResponse,
             ),
         )
-        reply = response.text
+        
+        try:
+            response_json = json.loads(response.text)
+            summary = response_json.get("summary", "")
+            full = response_json.get("full", "")
+            if not summary or not full:
+                raise ValueError("JSON missing summary or full key")
+        except (json.JSONDecodeError, ValueError) as json_err:
+            logger.warning(f"Failed to parse Gemini JSON: {json_err}. Falling back to raw text.")
+            full = response.text
+            summary = (full[:400] + "...\n\n(นี่คือคำตอบย่อ กรุณากดปุ่มด้านล่างเพื่อดูคำตอบเต็ม)") if len(full) > 400 else full
+
+        # Cache the full response
+        user_last_response[user_id] = full
+
+        # Create quick reply for the summary response
+        reply_items = [
+            QuickReplyButton(action=PostbackAction(
+                label="📖 อ่านคำตอบแบบเต็ม",
+                data="action=show_full"
+            ))
+        ]
+        reply_items.extend(QUICK_REPLIES.items)
+        summary_quick_reply = QuickReply(items=reply_items)
+
+        send_split_messages(event.reply_token, summary, summary_quick_reply)
+
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
-        reply = "ขออภัยครับ ขณะนี้ระบบประมวลผลขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง"
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text="ขออภัยครับ ขณะนี้ระบบประมวลผลขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง",
+                    quick_reply=QUICK_REPLIES
+                )
+            )
+        except Exception as e_reply:
+            logger.error(f"Failed to reply error message: {e_reply}")
 
-    try:
-        # LINE limits text messages to 5000 characters. Split the reply into chunks of 4900 characters.
-        limit = 4900
-        chunks = [reply[i:i+limit] for i in range(0, len(reply), limit)][:5]
-        messages = []
-        for idx, chunk in enumerate(chunks):
-            if idx == len(chunks) - 1:
-                messages.append(TextSendMessage(text=chunk, quick_reply=QUICK_REPLIES))
-            else:
-                messages.append(TextSendMessage(text=chunk))
-        
-        line_bot_api.reply_message(
-            event.reply_token,
-            messages
-        )
-    except Exception as e:
-        logger.error(f"Line Reply Error: {e}")
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    user_id = event.source.user_id
+    data = event.postback.data
+    
+    if data == "action=show_full":
+        full_answer = user_last_response.get(user_id)
+        if full_answer:
+            send_split_messages(event.reply_token, full_answer, QUICK_REPLIES)
+        else:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text="ขออภัยครับ ข้อมูลคำตอบหมดอายุแล้ว กรุณาส่งคำถามใหม่อีกครั้งครับ 🙏",
+                        quick_reply=QUICK_REPLIES
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Expired Postback Error: {e}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
