@@ -41,6 +41,51 @@ user_request_timestamps = defaultdict(list)
 # In-memory storage to cache the last full answer for each user: {user_id: full_answer}
 user_last_response = {}
 
+# Caching variables for Obsidian knowledge
+obsidian_knowledge_cache = ""
+obsidian_cache_last_loaded = 0.0
+OBSIDIAN_CACHE_TTL = 300.0 # 5 minutes in seconds
+
+def load_obsidian_knowledge(vault_path):
+    global obsidian_knowledge_cache, obsidian_cache_last_loaded
+    now = time.time()
+    
+    # Return cache if TTL has not expired
+    if obsidian_knowledge_cache and (now - obsidian_cache_last_loaded < OBSIDIAN_CACHE_TTL):
+        return obsidian_knowledge_cache
+        
+    if not vault_path or not os.path.exists(vault_path):
+        logger.warning(f"Obsidian vault path does not exist: {vault_path}")
+        return ""
+        
+    logger.info(f"Loading Obsidian knowledge from {vault_path}...")
+    knowledge_text = []
+    
+    try:
+        for root, dirs, files in os.walk(vault_path):
+            # Skip hidden directories like .obsidian, .git
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for file in files:
+                if file.endswith('.md'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        rel_path = os.path.relpath(file_path, vault_path)
+                        # Format in XML tags for structured LLM parsing
+                        knowledge_text.append(f'<document source="{rel_path}">\n{content}\n</document>')
+                    except Exception as e:
+                        logger.error(f"Error reading file {file_path}: {e}")
+                        
+        obsidian_knowledge_cache = "\n\n".join(knowledge_text)
+        obsidian_cache_last_loaded = now
+        logger.info(f"Successfully loaded {len(knowledge_text)} files from Obsidian vault.")
+    except Exception as e:
+        logger.error(f"Error walking vault path {vault_path}: {e}")
+        
+    return obsidian_knowledge_cache
+
 # Limits to save tokens and prevent billing abuse
 RATE_LIMIT_PER_MINUTE = 5
 RATE_LIMIT_PER_DAY = 50
@@ -196,12 +241,21 @@ def handle_message(event):
         return
 
     try:
+        # Load Obsidian knowledge dynamically
+        obsidian_vault_path = os.environ.get("OBSIDIAN_VAULT_PATH", r"c:\llm wiki\gemini second brain")
+        knowledge_base = load_obsidian_knowledge(obsidian_vault_path)
+        
+        # Combine system instruction with knowledge base
+        full_system_prompt = SYSTEM_PROMPT
+        if knowledge_base:
+            full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
+            
         max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 1500))
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=user_message,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=full_system_prompt,
                 max_output_tokens=max_tokens,
                 response_mime_type="application/json",
                 response_schema=LegalResponse,
