@@ -36,10 +36,56 @@ line_bot_api = LineBotApi(line_access_token)
 handler = WebhookHandler(line_secret)
 gemini_client = genai.Client(api_key=gemini_api_key)
 
-# In-memory storage to track user request timestamps: {user_id: [timestamp1, timestamp2, ...]}
-user_request_timestamps = defaultdict(list)
-# In-memory storage to cache the last full answer for each user: {user_id: full_answer}
-user_last_response = {}
+import sqlite3
+
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "database.db")
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    logger.info("Initializing database...")
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Rate limit table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    user_id TEXT,
+                    timestamp REAL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_limits_user_timestamp ON rate_limits(user_id, timestamp)')
+            
+            # Response cache table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS response_cache (
+                    user_id TEXT PRIMARY KEY,
+                    full_answer TEXT,
+                    updated_at REAL
+                )
+            ''')
+            
+            # Chat history table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    role TEXT,
+                    message TEXT,
+                    timestamp REAL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_user_timestamp ON chat_history(user_id, timestamp)')
+            conn.commit()
+            logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
+# Call init_db immediately
+init_db()
 
 # Caching variables for Obsidian knowledge
 obsidian_knowledge_cache = ""
@@ -105,24 +151,142 @@ def is_rate_limited(user_id):
         return False, ""
         
     now = time.time()
-    timestamps = user_request_timestamps[user_id]
+    one_day_ago = now - 86400
+    one_minute_ago = now - 60
     
-    # Filter out timestamps older than 24 hours (86400 seconds)
-    timestamps = [t for t in timestamps if now - t < 86400]
-    user_request_timestamps[user_id] = timestamps
-    
-    # Check daily limit
-    if len(timestamps) >= RATE_LIMIT_PER_DAY:
-        return True, "ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน (50 ครั้ง/วัน) แล้ว กรุณาลองใหม่ในวันพรุ่งนี้ครับ 🙏"
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Clean up old timestamps older than 24 hours to keep table small
+            cursor.execute('DELETE FROM rate_limits WHERE timestamp < ?', (one_day_ago,))
+            
+            # Check daily limit
+            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id, one_day_ago))
+            day_count = cursor.fetchone()[0]
+            if day_count >= RATE_LIMIT_PER_DAY:
+                return True, "ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน (50 ครั้ง/วัน) แล้ว กรุณาลองใหม่ในวันพรุ่งนี้ครับ 🙏"
+                
+            # Check minute limit (60 seconds)
+            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id, one_minute_ago))
+            minute_count = cursor.fetchone()[0]
+            if minute_count >= RATE_LIMIT_PER_MINUTE:
+                return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️"
+                
+            # Add current timestamp
+            cursor.execute('INSERT INTO rate_limits (user_id, timestamp) VALUES (?, ?)', (user_id, now))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Database error in is_rate_limited: {e}")
+        # Fail-open: if DB fails, allow request but log error
         
-    # Check minute limit (60 seconds)
-    recent_minute = [t for t in timestamps if now - t < 60]
-    if len(recent_minute) >= RATE_LIMIT_PER_MINUTE:
-        return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️"
-        
-    # Add current timestamp
-    user_request_timestamps[user_id].append(now)
     return False, ""
+
+def cache_full_response(user_id, full_answer):
+    if not user_id:
+        return
+    now = time.time()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO response_cache (user_id, full_answer, updated_at)
+                VALUES (?, ?, ?)
+            ''', (user_id, full_answer, now))
+            # Clean up expired responses older than 2 hours to keep database size small
+            cursor.execute('DELETE FROM response_cache WHERE updated_at < ?', (now - 7200,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Database error in cache_full_response: {e}")
+
+def get_cached_response(user_id):
+    if not user_id:
+        return None
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT full_answer FROM response_cache WHERE user_id = ?', (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+    except Exception as e:
+        logger.error(f"Database error in get_cached_response: {e}")
+    return None
+
+def add_chat_turn(user_id, role, text):
+    if not user_id or not text:
+        return
+    now = time.time()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO chat_history (user_id, role, message, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, role, text, now))
+            
+            # Keep history to maximum of 10 messages per user to save storage
+            cursor.execute('''
+                DELETE FROM chat_history 
+                WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM chat_history 
+                    WHERE user_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 10
+                )
+            ''', (user_id, user_id))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Database error in add_chat_turn: {e}")
+
+def get_chat_history_for_gemini(user_id, limit=4):
+    """
+    Returns a list of types.Content objects representing the conversation history
+    for the given user_id, in chronological order.
+    """
+    history_contents = []
+    if not user_id:
+        return history_contents
+        
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT role, message FROM chat_history 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (user_id, limit))
+            rows = cursor.fetchall()
+            
+            # Since we fetched DESC, reverse to make it chronological (ASC)
+            rows.reverse()
+            
+            for row in rows:
+                role = row[0]
+                message = row[1]
+                history_contents.append(
+                    types.Content(
+                        role=role,
+                        parts=[types.Part.from_text(text=message)]
+                    )
+                )
+    except Exception as e:
+        logger.error(f"Database error in get_chat_history_for_gemini: {e}")
+        
+    return history_contents
+
+def clear_chat_history(user_id):
+    if not user_id:
+        return
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM chat_history WHERE user_id = ?', (user_id,))
+            conn.commit()
+            logger.info(f"Cleared chat history for user: {user_id}")
+    except Exception as e:
+        logger.error(f"Database error in clear_chat_history: {e}")
 
 SYSTEM_PROMPT = """คุณคือ "นายดี" ผู้ช่วยด้านกฎหมายไทย
 เชี่ยวชาญเรื่องสิทธิ์ของประชาชนไทยทั่วไป
@@ -218,10 +382,12 @@ def handle_follow(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_message = event.message.text
+    user_id = event.source.user_id
     
     # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting
     greetings = ["สวัสดี", "หวัดดี", "hello", "hi", "เริ่ม", "start"]
     if any(g in user_message.lower() for g in greetings):
+        clear_chat_history(user_id)
         try:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -235,7 +401,6 @@ def handle_message(event):
         return
 
     # Check rate limits per user to prevent API spam and save token billing
-    user_id = event.source.user_id
     limited, limit_message = is_rate_limited(user_id)
     if limited:
         try:
@@ -257,10 +422,20 @@ def handle_message(event):
         if knowledge_base:
             full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
             
+        # Get chat history (up to last 4 turns)
+        history = get_chat_history_for_gemini(user_id, limit=4)
+        # Construct Gemini API contents
+        gemini_contents = history + [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_message)]
+            )
+        ]
+        
         max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 1500))
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
-            contents=user_message,
+            contents=gemini_contents,
             config=types.GenerateContentConfig(
                 system_instruction=full_system_prompt,
                 max_output_tokens=max_tokens,
@@ -332,8 +507,12 @@ def handle_message(event):
                 full = response.text
                 summary = (full[:400] + "...\n\n(นี่คือคำตอบย่อ กรุณากดปุ่มด้านล่างเพื่อดูคำตอบเต็ม)") if len(full) > 400 else full
 
-        # Cache the full response
-        user_last_response[user_id] = full
+        # Cache the full response in database
+        cache_full_response(user_id, full)
+        
+        # Save user query and assistant response to chat history
+        add_chat_turn(user_id, "user", user_message)
+        add_chat_turn(user_id, "model", summary)
 
         # Create quick reply for the summary response
         reply_items = [
@@ -366,7 +545,7 @@ def handle_postback(event):
     data = event.postback.data
     
     if data == "action=show_full":
-        full_answer = user_last_response.get(user_id)
+        full_answer = get_cached_response(user_id)
         if full_answer:
             send_split_messages(event.reply_token, full_answer, QUICK_REPLIES)
         else:
