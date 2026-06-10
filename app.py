@@ -44,15 +44,34 @@ gemini_client = genai.Client(api_key=gemini_api_key)
 import sqlite3
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "database.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-    except Exception as e:
-        logger.error(f"Failed to set WAL mode: {e}")
-    return conn
+    if DATABASE_URL:
+        import psycopg2
+        from psycopg2.extras import DictCursor
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url, sslmode='require', cursor_factory=DictCursor)
+        return conn
+    else:
+        conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except Exception as e:
+            logger.error(f"Failed to set WAL mode: {e}")
+        return conn
+
+def execute_sql(cursor, query, params=None):
+    if not DATABASE_URL:
+        query = query.replace('%s', '?')
+    if params is not None:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
+    return cursor
 
 def hash_user_id(user_id):
     if not user_id:
@@ -100,6 +119,7 @@ def init_db():
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
+            
             # Rate limit table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS rate_limits (
@@ -108,14 +128,25 @@ def init_db():
                     tokens INTEGER DEFAULT 0
                 )
             ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_limits_user_timestamp ON rate_limits(user_id, timestamp)')
             
-            # Check if tokens column exists in rate_limits
-            cursor.execute("PRAGMA table_info(rate_limits)")
-            columns = [info[1] for info in cursor.fetchall()]
-            if 'tokens' not in columns:
-                logger.info("Migrating rate_limits table to add tokens column...")
-                cursor.execute("ALTER TABLE rate_limits ADD COLUMN tokens INTEGER DEFAULT 0")
+            # Check if tokens column exists in rate_limits (SQLite vs PostgreSQL migration)
+            if DATABASE_URL:
+                cursor.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='rate_limits' AND column_name='tokens'
+                """)
+                if not cursor.fetchone():
+                    logger.info("Migrating Postgres rate_limits table to add tokens column...")
+                    cursor.execute("ALTER TABLE rate_limits ADD COLUMN tokens INTEGER DEFAULT 0")
+            else:
+                cursor.execute("PRAGMA table_info(rate_limits)")
+                columns = [info[1] for info in cursor.fetchall()]
+                if 'tokens' not in columns:
+                    logger.info("Migrating SQLite rate_limits table to add tokens column...")
+                    cursor.execute("ALTER TABLE rate_limits ADD COLUMN tokens INTEGER DEFAULT 0")
+
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_limits_user_timestamp ON rate_limits(user_id, timestamp)')
             
             # Response cache table
             cursor.execute('''
@@ -127,15 +158,26 @@ def init_db():
             ''')
             
             # Chat history table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS chat_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT,
-                    role TEXT,
-                    message TEXT,
-                    timestamp REAL
-                )
-            ''')
+            if DATABASE_URL:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS chat_history (
+                        id SERIAL PRIMARY KEY,
+                        user_id TEXT,
+                        role TEXT,
+                        message TEXT,
+                        timestamp REAL
+                    )
+                ''')
+            else:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS chat_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        role TEXT,
+                        message TEXT,
+                        timestamp REAL
+                    )
+                ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_history_user_timestamp ON chat_history(user_id, timestamp)')
             
             # User states table (for feedback flow and other stateful interactions)
@@ -148,14 +190,24 @@ def init_db():
             ''')
             
             # Feedbacks table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS feedbacks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT,
-                    feedback_text TEXT,
-                    timestamp REAL
-                )
-            ''')
+            if DATABASE_URL:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS feedbacks (
+                        id SERIAL PRIMARY KEY,
+                        user_id TEXT,
+                        feedback_text TEXT,
+                        timestamp REAL
+                    )
+                ''')
+            else:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS feedbacks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        feedback_text TEXT,
+                        timestamp REAL
+                    )
+                ''')
             
             # Question-Answer cache table
             cursor.execute('''
@@ -173,7 +225,8 @@ def init_db():
             
             conn.commit()
             logger.info("Database initialized successfully.")
-        migrate_database_user_ids()
+        if not DATABASE_URL:
+            migrate_database_user_ids()
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
 
@@ -284,11 +337,12 @@ def get_quota_status(user_id):
         with get_db_connection() as conn:
             cursor = conn.cursor()
             # Clean up old timestamps older than 24 hours to keep table small
-            cursor.execute('DELETE FROM rate_limits WHERE timestamp < ?', (one_day_ago,))
+            execute_sql(cursor, 'DELETE FROM rate_limits WHERE timestamp < %s', (one_day_ago,))
             conn.commit()
             
-            cursor.execute(
-                'SELECT timestamp, tokens FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
+            execute_sql(
+                cursor,
+                'SELECT timestamp, tokens FROM rate_limits WHERE user_id = %s AND timestamp >= %s ORDER BY timestamp ASC',
                 (user_id_hashed, one_day_ago)
             )
             rows = cursor.fetchall()
@@ -327,8 +381,9 @@ def update_quota_tokens(user_id, timestamp, tokens):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE rate_limits SET tokens = ? WHERE user_id = ? AND timestamp = ?',
+            execute_sql(
+                cursor,
+                'UPDATE rate_limits SET tokens = %s WHERE user_id = %s AND timestamp = %s',
                 (tokens, user_id_hashed, timestamp)
             )
             conn.commit()
@@ -350,10 +405,10 @@ def is_rate_limited(user_id):
             cursor = conn.cursor()
             
             # Clean up old timestamps older than 24 hours to keep table small
-            cursor.execute('DELETE FROM rate_limits WHERE timestamp < ?', (one_day_ago,))
+            execute_sql(cursor, 'DELETE FROM rate_limits WHERE timestamp < %s', (one_day_ago,))
             
             # Fetch all timestamps and tokens in the last 24 hours
-            cursor.execute('SELECT timestamp, tokens FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC', (user_id_hashed, one_day_ago))
+            execute_sql(cursor, 'SELECT timestamp, tokens FROM rate_limits WHERE user_id = %s AND timestamp >= %s ORDER BY timestamp ASC', (user_id_hashed, one_day_ago))
             rows = cursor.fetchall()
             day_count = len(rows)
             total_tokens_used = sum(r[1] for r in rows if r[1] is not None)
@@ -387,13 +442,13 @@ def is_rate_limited(user_id):
                 return True, f"ขออภัยครับ คุณใช้งานโควต้าจำนวนคำ/ข้อความ (Tokens) ครบกำหนดสูงสุดต่อวัน ({RATE_LIMIT_TOKENS_PER_DAY:,} tokens/วัน) แล้ว จะสามารถใช้งานครั้งต่อไปได้ในอีก {wait_str} ({next_reset_str}) 🙏", 0.0
                 
             # Check minute limit (60 seconds)
-            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id_hashed, one_minute_ago))
+            execute_sql(cursor, 'SELECT COUNT(*) FROM rate_limits WHERE user_id = %s AND timestamp >= %s', (user_id_hashed, one_minute_ago))
             minute_count = cursor.fetchone()[0]
             if minute_count >= RATE_LIMIT_PER_MINUTE:
                 return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️", 0.0
                 
             # Add current timestamp
-            cursor.execute('INSERT INTO rate_limits (user_id, timestamp, tokens) VALUES (?, ?, 0)', (user_id_hashed, now))
+            execute_sql(cursor, 'INSERT INTO rate_limits (user_id, timestamp, tokens) VALUES (%s, %s, 0)', (user_id_hashed, now))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in is_rate_limited: {e}")
@@ -409,12 +464,21 @@ def cache_full_response(user_id, full_answer):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO response_cache (user_id, full_answer, updated_at)
-                VALUES (?, ?, ?)
-            ''', (user_id, full_answer, now))
-            # Clean up expired responses older than 2 hours to keep database size small
-            cursor.execute('DELETE FROM response_cache WHERE updated_at < ?', (now - 7200,))
+            if DATABASE_URL:
+                query = '''
+                    INSERT INTO response_cache (user_id, full_answer, updated_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET full_answer = EXCLUDED.full_answer, updated_at = EXCLUDED.updated_at
+                '''
+                cursor.execute(query, (user_id, full_answer, now))
+                cursor.execute('DELETE FROM response_cache WHERE updated_at < %s', (now - 7200,))
+            else:
+                query = '''
+                    INSERT OR REPLACE INTO response_cache (user_id, full_answer, updated_at)
+                    VALUES (?, ?, ?)
+                '''
+                cursor.execute(query, (user_id, full_answer, now))
+                cursor.execute('DELETE FROM response_cache WHERE updated_at < ?', (now - 7200,))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in cache_full_response: {e}")
@@ -426,7 +490,7 @@ def get_cached_response(user_id):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT full_answer FROM response_cache WHERE user_id = ?', (user_id,))
+            execute_sql(cursor, 'SELECT full_answer FROM response_cache WHERE user_id = %s', (user_id,))
             row = cursor.fetchone()
             if row:
                 return row[0]
@@ -445,10 +509,10 @@ def get_qa_cache(user_id, question):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            execute_sql(cursor, '''
                 SELECT summary, full_answer, is_legal_question 
                 FROM qa_cache 
-                WHERE user_id = ? AND question = ? AND timestamp >= ?
+                WHERE user_id = %s AND question = %s AND timestamp >= %s
             ''', (user_id_hashed, cleaned_question, ttl_limit))
             row = cursor.fetchone()
             if row:
@@ -470,12 +534,25 @@ def save_qa_cache(user_id, question, summary, full_answer, is_legal_question):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO qa_cache (user_id, question, summary, full_answer, is_legal_question, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id_hashed, cleaned_question, summary, full_answer, int(is_legal_question), now))
-            # Clean up old cache entries older than 3 days to keep database small
-            cursor.execute('DELETE FROM qa_cache WHERE timestamp < ?', (now - 259200,))
+            if DATABASE_URL:
+                query = '''
+                    INSERT INTO qa_cache (user_id, question, summary, full_answer, is_legal_question, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, question) DO UPDATE SET 
+                        summary = EXCLUDED.summary, 
+                        full_answer = EXCLUDED.full_answer, 
+                        is_legal_question = EXCLUDED.is_legal_question, 
+                        timestamp = EXCLUDED.timestamp
+                '''
+                cursor.execute(query, (user_id_hashed, cleaned_question, summary, full_answer, int(is_legal_question), now))
+                cursor.execute('DELETE FROM qa_cache WHERE timestamp < %s', (now - 259200,))
+            else:
+                query = '''
+                    INSERT OR REPLACE INTO qa_cache (user_id, question, summary, full_answer, is_legal_question, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                '''
+                cursor.execute(query, (user_id_hashed, cleaned_question, summary, full_answer, int(is_legal_question), now))
+                cursor.execute('DELETE FROM qa_cache WHERE timestamp < ?', (now - 259200,))
             conn.commit()
     except Exception as e:
         logger.error(f"Error saving to qa_cache: {e}")
@@ -488,17 +565,17 @@ def add_chat_turn(user_id, role, text):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            execute_sql(cursor, '''
                 INSERT INTO chat_history (user_id, role, message, timestamp)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             ''', (user_id, role, text, now))
             
             # Keep history to maximum of 10 messages per user to save storage
-            cursor.execute('''
+            execute_sql(cursor, '''
                 DELETE FROM chat_history 
-                WHERE user_id = ? AND id NOT IN (
+                WHERE user_id = %s AND id NOT IN (
                     SELECT id FROM chat_history 
-                    WHERE user_id = ? 
+                    WHERE user_id = %s 
                     ORDER BY timestamp DESC 
                     LIMIT 10
                 )
@@ -520,11 +597,11 @@ def get_chat_history_for_gemini(user_id, limit=4):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            execute_sql(cursor, '''
                 SELECT role, message FROM chat_history 
-                WHERE user_id = ? 
+                WHERE user_id = %s 
                 ORDER BY timestamp DESC 
-                LIMIT ?
+                LIMIT %s
             ''', (user_id, limit))
             rows = cursor.fetchall()
             
@@ -552,7 +629,7 @@ def clear_chat_history(user_id):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM chat_history WHERE user_id = ?', (user_id,))
+            execute_sql(cursor, 'DELETE FROM chat_history WHERE user_id = %s', (user_id,))
             conn.commit()
             logger.info(f"Cleared chat history for user: {user_id}")
     except Exception as e:
@@ -565,7 +642,7 @@ def get_user_state(user_id):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT state FROM user_states WHERE user_id = ?', (user_id,))
+            execute_sql(cursor, 'SELECT state FROM user_states WHERE user_id = %s', (user_id,))
             row = cursor.fetchone()
             if row:
                 return row[0]
@@ -581,10 +658,19 @@ def set_user_state(user_id, state):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO user_states (user_id, state, timestamp)
-                VALUES (?, ?, ?)
-            ''', (user_id, state, now))
+            if DATABASE_URL:
+                query = '''
+                    INSERT INTO user_states (user_id, state, timestamp)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, timestamp = EXCLUDED.timestamp
+                '''
+                cursor.execute(query, (user_id, state, now))
+            else:
+                query = '''
+                    INSERT OR REPLACE INTO user_states (user_id, state, timestamp)
+                    VALUES (?, ?, ?)
+                '''
+                cursor.execute(query, (user_id, state, now))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in set_user_state: {e}")
@@ -596,7 +682,7 @@ def clear_user_state(user_id):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM user_states WHERE user_id = ?', (user_id,))
+            execute_sql(cursor, 'DELETE FROM user_states WHERE user_id = %s', (user_id,))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in clear_user_state: {e}")
@@ -609,9 +695,9 @@ def save_feedback(user_id, feedback_text):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
+            execute_sql(cursor, '''
                 INSERT INTO feedbacks (user_id, feedback_text, timestamp)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
             ''', (user_id, feedback_text, now))
             conn.commit()
             logger.info(f"Feedback saved for user: {user_id}")

@@ -9,12 +9,22 @@ from google.genai import types
 load_dotenv()
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "database.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if DATABASE_URL:
+        import psycopg2
+        from psycopg2.extras import DictCursor
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url, sslmode='require', cursor_factory=DictCursor)
+        return conn
+    else:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def main():
     if not GEMINI_API_KEY:
@@ -25,10 +35,18 @@ def main():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Check if table exists
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feedbacks'")
-        if not cursor.fetchone():
+        
+        # Check if table exists (SQLite vs Postgres)
+        if DATABASE_URL:
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'feedbacks')")
+            table_exists = cursor.fetchone()[0]
+        else:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='feedbacks'")
+            table_exists = cursor.fetchone()
+            
+        if not table_exists:
             print("Table 'feedbacks' does not exist yet. Please run app.py or interact with the bot first.")
+            conn.close()
             return
 
         cursor.execute("SELECT id, user_id, feedback_text, timestamp FROM feedbacks ORDER BY timestamp DESC")
