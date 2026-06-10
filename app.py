@@ -11,6 +11,7 @@ from google.genai import types
 import os
 import logging
 import time
+import datetime
 import json
 import hashlib
 import re
@@ -224,9 +225,78 @@ class LegalResponse(BaseModel):
     full: str = Field(description="รายละเอียดคำตอบแบบเต็ม ครบถ้วนตามข้อกฎหมาย มีขั้นตอนการดำเนินการ และ disclaimer ท้ายคำตอบ (หาก is_legal_question เป็น False ให้พิมพ์ปฏิเสธการตอบเรื่องนอกเหนือกฎหมายอย่างสุภาพที่นี่)")
     sources: list[SourceItem] = Field(default=[], description="รายการแหล่งอ้างอิงทางกฎหมายหรือหน่วยงานรัฐที่เกี่ยวข้อง (จำกัดไม่เกิน 3 แหล่งอ้างอิง) หาก is_legal_question เป็น False ให้เป็นลิสต์ว่าง")
 
+def format_relative_time(seconds):
+    if seconds <= 0:
+        return "ทันที"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if hours > 0:
+        return f"{hours} ชั่วโมง {minutes} นาที"
+    else:
+        return f"{minutes} นาที"
+
+def format_thai_datetime(timestamp):
+    tz_offset = datetime.timezone(datetime.timedelta(hours=7))
+    dt = datetime.datetime.fromtimestamp(timestamp, tz=tz_offset)
+    
+    thai_months = [
+        "", "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+        "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."
+    ]
+    
+    day = dt.day
+    month = thai_months[dt.month]
+    time_str = dt.strftime("%H:%M")
+    return f"{day} {month} {dt.year + 543} เวลา {time_str} น."
+
+def get_quota_status(user_id):
+    user_id_hashed = hash_user_id(user_id)
+    if not user_id_hashed:
+        return None
+        
+    now = time.time()
+    one_day_ago = now - 86400
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Clean up old timestamps older than 24 hours to keep table small
+            cursor.execute('DELETE FROM rate_limits WHERE timestamp < ?', (one_day_ago,))
+            conn.commit()
+            
+            cursor.execute(
+                'SELECT timestamp FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
+                (user_id_hashed, one_day_ago)
+            )
+            rows = cursor.fetchall()
+            timestamps = [row[0] for row in rows]
+            
+            used = len(timestamps)
+            remaining = max(0, RATE_LIMIT_PER_DAY - used)
+            
+            next_reset_time = None
+            next_reset_in_seconds = None
+            
+            if used > 0:
+                oldest_timestamp = timestamps[0]
+                next_reset_timestamp = oldest_timestamp + 86400
+                next_reset_in_seconds = max(0.0, next_reset_timestamp - now)
+                next_reset_time = next_reset_timestamp
+                
+            return {
+                'used': used,
+                'limit': RATE_LIMIT_PER_DAY,
+                'remaining': remaining,
+                'next_reset_timestamp': next_reset_time,
+                'next_reset_in_seconds': next_reset_in_seconds
+            }
+    except Exception as e:
+        logger.error(f"Database error in get_quota_status: {e}")
+        return None
+
 def is_rate_limited(user_id):
-    user_id = hash_user_id(user_id)
-    if not user_id:
+    user_id_hashed = hash_user_id(user_id)
+    if not user_id_hashed:
         return False, ""
         
     now = time.time()
@@ -241,19 +311,26 @@ def is_rate_limited(user_id):
             cursor.execute('DELETE FROM rate_limits WHERE timestamp < ?', (one_day_ago,))
             
             # Check daily limit
-            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id, one_day_ago))
-            day_count = cursor.fetchone()[0]
+            cursor.execute('SELECT timestamp FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC', (user_id_hashed, one_day_ago))
+            rows = cursor.fetchall()
+            day_count = len(rows)
+            
             if day_count >= RATE_LIMIT_PER_DAY:
-                return True, "ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน (50 ครั้ง/วัน) แล้ว กรุณาลองใหม่ในวันพรุ่งนี้ครับ 🙏"
+                oldest_timestamp = rows[0][0]
+                next_reset = oldest_timestamp + 86400
+                wait_seconds = next_reset - now
+                wait_str = format_relative_time(wait_seconds)
+                next_reset_str = format_thai_datetime(next_reset)
+                return True, f"ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน ({RATE_LIMIT_PER_DAY} ครั้ง/วัน) แล้ว จะสามารถใช้งานครั้งต่อไปได้ในอีก {wait_str} ({next_reset_str}) 🙏"
                 
             # Check minute limit (60 seconds)
-            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id, one_minute_ago))
+            cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id_hashed, one_minute_ago))
             minute_count = cursor.fetchone()[0]
             if minute_count >= RATE_LIMIT_PER_MINUTE:
                 return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️"
                 
             # Add current timestamp
-            cursor.execute('INSERT INTO rate_limits (user_id, timestamp) VALUES (?, ?)', (user_id, now))
+            cursor.execute('INSERT INTO rate_limits (user_id, timestamp) VALUES (?, ?)', (user_id_hashed, now))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in is_rate_limited: {e}")
@@ -473,6 +550,10 @@ QUICK_REPLIES = QuickReply(items=[
         text="มีปัญหาเรื่องมรดกหรือที่ดิน ผู้จัดการมรดกไม่แบ่งให้ยุติธรรม ทำยังไงได้บ้าง?"
     )),
     QuickReplyButton(action=MessageAction(
+        label="📊 เช็คโควต้าคงเหลือ",
+        text="เช็คโควต้า"
+    )),
+    QuickReplyButton(action=MessageAction(
         label="⚖️ ถามเรื่องอื่น",
         text="อยากถามเรื่องกฎหมายอื่นๆ"
     )),
@@ -596,6 +677,42 @@ def process_message_async(event):
                 )
             except Exception as e:
                 logger.error(f"Line Reply Feedback Request Error: {e}")
+            return
+
+        # 3. Check if user typed keywords to check quota/limit
+        quota_keywords = ["เช็คโควต้า", "โควต้า", "เช็คสิทธิ์", "ดูสิทธิ์", "quota", "limit", "เช็คลิมิต", "สิทธิ์การใช้งาน", "/quota", "/limit", "/status", "/check", "check", "status"]
+        if any(keyword in user_message.lower() for keyword in quota_keywords):
+            status = get_quota_status(user_id)
+            if status:
+                used = status['used']
+                limit = status['limit']
+                remaining = status['remaining']
+                
+                msg = "📊 *สถานะการใช้งานโควต้าของคุณ*\n\n"
+                msg += f"• ใช้งานไปแล้ว: {used} / {limit} ครั้ง\n"
+                msg += f"• คงเหลือ: {remaining} ครั้ง\n"
+                
+                if used > 0:
+                    next_reset = status['next_reset_timestamp']
+                    wait_seconds = next_reset - time.time()
+                    wait_str = format_relative_time(wait_seconds)
+                    next_reset_str = format_thai_datetime(next_reset)
+                    msg += f"• โควต้าถัดไปจะคืนสิทธิ์ในอีก: {wait_str}\n  ({next_reset_str})"
+                else:
+                    msg += "• โควต้าเต็ม: สามารถใช้งานได้ทันที"
+            else:
+                msg = "ขออภัยครับ ไม่สามารถดึงข้อมูลโควต้าได้ในขณะนี้"
+                
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text=msg,
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Quota Status Error: {e}")
             return
 
         # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting
