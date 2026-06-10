@@ -16,6 +16,8 @@ import hashlib
 import re
 from collections import defaultdict
 from dotenv import load_dotenv
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 # ตั้งค่า Logging
@@ -43,8 +45,12 @@ import sqlite3
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "database.db")
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception as e:
+        logger.error(f"Failed to set WAL mode: {e}")
     return conn
 
 def hash_user_id(user_id):
@@ -155,6 +161,7 @@ init_db()
 obsidian_knowledge_cache = ""
 obsidian_cache_last_loaded = 0.0
 OBSIDIAN_CACHE_TTL = 300.0 # 5 minutes in seconds
+obsidian_lock = threading.Lock()
 
 def load_obsidian_knowledge(vault_path):
     global obsidian_knowledge_cache, obsidian_cache_last_loaded
@@ -164,36 +171,42 @@ def load_obsidian_knowledge(vault_path):
     if obsidian_knowledge_cache and (now - obsidian_cache_last_loaded < OBSIDIAN_CACHE_TTL):
         return obsidian_knowledge_cache
         
-    if not vault_path or not os.path.exists(vault_path):
-        logger.warning(f"Obsidian vault path does not exist: {vault_path}")
-        return ""
-        
-    logger.info(f"Loading Obsidian knowledge from {vault_path}...")
-    knowledge_text = []
-    
-    try:
-        for root, dirs, files in os.walk(vault_path):
-            # Skip hidden directories like .obsidian, .git
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
+    with obsidian_lock:
+        # Double check cache within lock
+        now = time.time()
+        if obsidian_knowledge_cache and (now - obsidian_cache_last_loaded < OBSIDIAN_CACHE_TTL):
+            return obsidian_knowledge_cache
             
-            for file in files:
-                if file.endswith('.md'):
-                    file_path = os.path.join(root, file)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        rel_path = os.path.relpath(file_path, vault_path)
-                        # Format in XML tags for structured LLM parsing
-                        knowledge_text.append(f'<document source="{rel_path}">\n{content}\n</document>')
-                    except Exception as e:
-                        logger.error(f"Error reading file {file_path}: {e}")
-                        
-        obsidian_knowledge_cache = "\n\n".join(knowledge_text)
-        obsidian_cache_last_loaded = now
-        logger.info(f"Successfully loaded {len(knowledge_text)} files from Obsidian vault.")
-    except Exception as e:
-        logger.error(f"Error walking vault path {vault_path}: {e}")
+        if not vault_path or not os.path.exists(vault_path):
+            logger.warning(f"Obsidian vault path does not exist: {vault_path}")
+            return ""
+            
+        logger.info(f"Loading Obsidian knowledge from {vault_path}...")
+        knowledge_text = []
         
+        try:
+            for root, dirs, files in os.walk(vault_path):
+                # Skip hidden directories like .obsidian, .git
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                
+                for file in files:
+                    if file.endswith('.md'):
+                        file_path = os.path.join(root, file)
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            rel_path = os.path.relpath(file_path, vault_path)
+                            # Format in XML tags for structured LLM parsing
+                            knowledge_text.append(f'<document source="{rel_path}">\n{content}\n</document>')
+                        except Exception as e:
+                            logger.error(f"Error reading file {file_path}: {e}")
+                            
+            obsidian_knowledge_cache = "\n\n".join(knowledge_text)
+            obsidian_cache_last_loaded = now
+            logger.info(f"Successfully loaded {len(knowledge_text)} files from Obsidian vault.")
+        except Exception as e:
+            logger.error(f"Error walking vault path {vault_path}: {e}")
+            
     return obsidian_knowledge_cache
 
 # Limits to save tokens and prevent billing abuse
@@ -523,203 +536,211 @@ def handle_follow(event):
     except Exception as e:
         logger.error(f"Line Reply Follow Error: {e}")
 
+executor = ThreadPoolExecutor(max_workers=20)
+
+def process_message_async(event):
+    try:
+        user_message = scrub_pii(event.message.text)
+        user_id = event.source.user_id
+        
+        # 1. Check if user is currently in the feedback state
+        state = get_user_state(user_id)
+        if state == "WAITING_FOR_FEEDBACK":
+            save_feedback(user_id, user_message)
+            clear_user_state(user_id)
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ขอบคุณสำหรับข้อเสนอแนะและรายงานปัญหาครับ Moon จะนำข้อมูลไปวิเคราะห์และปรับปรุงระบบต่อไปครับ 🙏",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Feedback Thankyou Error: {e}")
+            return
+
+        # 2. Check if user typed keywords to submit feedback
+        feedback_keywords = ["แจ้งปัญหา", "รายงานปัญหา", "feedback", "ติชม", "ส่งข้อเสนอแนะ"]
+        if any(keyword in user_message.lower() for keyword in feedback_keywords):
+            set_user_state(user_id, "WAITING_FOR_FEEDBACK")
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="กรุณาพิมพ์ปัญหาการใช้งาน หรือข้อเสนอแนะที่ต้องการแจ้งได้เลยครับ (ส่งข้อความถัดไปมาได้เลยครับ) 📝"
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Feedback Request Error: {e}")
+            return
+
+        # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting
+        greetings = ["สวัสดี", "หวัดดี", "hello", "hi", "เริ่ม", "start"]
+        if any(g in user_message.lower() for g in greetings):
+            clear_chat_history(user_id)
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text=WELCOME_MESSAGE,
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Welcome Error: {e}")
+            return
+
+        # Check rate limits per user to prevent API spam and save token billing
+        limited, limit_message = is_rate_limited(user_id)
+        if limited:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(text=limit_message)]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Rate Limit Error: {e}")
+            return
+
+        try:
+            # Load Obsidian knowledge dynamically
+            obsidian_vault_path = os.environ.get("OBSIDIAN_VAULT_PATH", r"c:\llm wiki\gemini second brain")
+            knowledge_base = load_obsidian_knowledge(obsidian_vault_path)
+            
+            # Combine system instruction with knowledge base
+            full_system_prompt = SYSTEM_PROMPT
+            if knowledge_base:
+                full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
+                
+            # Get chat history (up to last 4 turns)
+            history = get_chat_history_for_gemini(user_id, limit=4)
+            # Construct Gemini API contents
+            gemini_contents = history + [
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_message)]
+                )
+            ]
+            
+            max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 1500))
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=gemini_contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=full_system_prompt,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                    response_schema=LegalResponse,
+                ),
+            )
+            
+            try:
+                response_json = json.loads(response.text)
+                is_legal_question = response_json.get("is_legal_question", True)
+                summary = response_json.get("summary", "")
+                full = response_json.get("full", "")
+                sources = response_json.get("sources", [])
+                if not isinstance(sources, list):
+                    sources = []
+                
+                if not summary or not full:
+                    raise ValueError("JSON missing summary or full key")
+                
+                # Filter and format sources
+                formatted_sources = []
+                for item in sources:
+                    if isinstance(item, dict):
+                        title = item.get("title", "")
+                        url = item.get("url", "")
+                    else:
+                        title = getattr(item, "title", "")
+                        url = getattr(item, "url", "")
+                    
+                    if title and url:
+                        # Clean up URL format
+                        url = url.strip()
+                        if not (url.startswith("http://") or url.startswith("https://")):
+                            url = "https://" + url
+                        formatted_sources.append(f"- {title}\n  🔗 {url}")
+                
+                if formatted_sources:
+                    sources_text = "\n\n🌐 แหล่งอ้างอิงของรัฐบาล/กฎหมาย:\n" + "\n".join(formatted_sources)
+                    summary += sources_text
+                    full += sources_text
+                    
+            except (json.JSONDecodeError, ValueError) as json_err:
+                logger.warning(f"Failed to parse Gemini JSON: {json_err}. Falling back to regex extraction.")
+                # Use regex to extract summary and full answer from truncated or malformed JSON
+                import re
+                is_legal_match = re.search(r'"is_legal_question"\s*:\s*(true|false)', response.text, re.IGNORECASE)
+                is_legal_question = False if (is_legal_match and is_legal_match.group(1).lower() == 'false') else True
+                summary_match = re.search(r'"summary"\s*:\s*"(.*?)"', response.text, re.DOTALL)
+                full_match = re.search(r'"full"\s*:\s*"(.*?)"', response.text, re.DOTALL)
+                
+                if summary_match or full_match:
+                    try:
+                        summary = summary_match.group(1).encode().decode('unicode-escape', errors='ignore') if summary_match else ""
+                    except Exception:
+                        summary = summary_match.group(1) if summary_match else ""
+                        
+                    try:
+                        full = full_match.group(1).encode().decode('unicode-escape', errors='ignore') if full_match else ""
+                    except Exception:
+                        full = full_match.group(1) if full_match else ""
+                    
+                    # Replace escaped newlines and double quotes
+                    summary = summary.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                    full = full.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                else:
+                    summary = ""
+                    full = ""
+    
+                if not summary or not full:
+                    # If regex fails completely, fall back to raw text stripping JSON structure
+                    full = response.text
+                    summary = (full[:400] + "...\n\n(นี่คือคำตอบย่อ กรุณากดปุ่มด้านล่างเพื่อดูคำตอบเต็ม)") if len(full) > 400 else full
+    
+            # Cache the full response in database
+            cache_full_response(user_id, full)
+            
+            # Save user query and assistant response to chat history
+            add_chat_turn(user_id, "user", user_message)
+            add_chat_turn(user_id, "model", summary)
+    
+            # Create quick reply for the summary response
+            if is_legal_question:
+                reply_items = [
+                    QuickReplyButton(action=PostbackAction(
+                        label="📖 อ่านคำตอบแบบเต็ม",
+                        data="action=show_full"
+                    ))
+                ]
+                reply_items.extend(QUICK_REPLIES.items)
+                summary_quick_reply = QuickReply(items=reply_items)
+            else:
+                summary_quick_reply = QUICK_REPLIES
+    
+            send_split_messages(event.reply_token, summary, summary_quick_reply)
+    
+        except Exception as e:
+            logger.error(f"Gemini API Error: {e}")
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ขออภัยครับ ขณะนี้ระบบประมวลผลขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e_reply:
+                logger.error(f"Failed to reply error message: {e_reply}")
+    except Exception as ex:
+        logger.error(f"Error in process_message_async: {ex}")
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_message = scrub_pii(event.message.text)
-    user_id = event.source.user_id
-    
-    # 1. Check if user is currently in the feedback state
-    state = get_user_state(user_id)
-    if state == "WAITING_FOR_FEEDBACK":
-        save_feedback(user_id, user_message)
-        clear_user_state(user_id)
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(
-                    text="ขอบคุณสำหรับข้อเสนอแนะและรายงานปัญหาครับ Moon จะนำข้อมูลไปวิเคราะห์และปรับปรุงระบบต่อไปครับ 🙏",
-                    quick_reply=QUICK_REPLIES
-                )]
-            )
-        except Exception as e:
-            logger.error(f"Line Reply Feedback Thankyou Error: {e}")
-        return
-
-    # 2. Check if user typed keywords to submit feedback
-    feedback_keywords = ["แจ้งปัญหา", "รายงานปัญหา", "feedback", "ติชม", "ส่งข้อเสนอแนะ"]
-    if any(keyword in user_message.lower() for keyword in feedback_keywords):
-        set_user_state(user_id, "WAITING_FOR_FEEDBACK")
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(
-                    text="กรุณาพิมพ์ปัญหาการใช้งาน หรือข้อเสนอแนะที่ต้องการแจ้งได้เลยครับ (ส่งข้อความถัดไปมาได้เลยครับ) 📝"
-                )]
-            )
-        except Exception as e:
-            logger.error(f"Line Reply Feedback Request Error: {e}")
-        return
-
-    # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting
-    greetings = ["สวัสดี", "หวัดดี", "hello", "hi", "เริ่ม", "start"]
-    if any(g in user_message.lower() for g in greetings):
-        clear_chat_history(user_id)
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(
-                    text=WELCOME_MESSAGE,
-                    quick_reply=QUICK_REPLIES
-                )]
-            )
-        except Exception as e:
-            logger.error(f"Line Reply Welcome Error: {e}")
-        return
-
-    # Check rate limits per user to prevent API spam and save token billing
-    limited, limit_message = is_rate_limited(user_id)
-    if limited:
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(text=limit_message)]
-            )
-        except Exception as e:
-            logger.error(f"Line Reply Rate Limit Error: {e}")
-        return
-
-    try:
-        # Load Obsidian knowledge dynamically
-        obsidian_vault_path = os.environ.get("OBSIDIAN_VAULT_PATH", r"c:\llm wiki\gemini second brain")
-        knowledge_base = load_obsidian_knowledge(obsidian_vault_path)
-        
-        # Combine system instruction with knowledge base
-        full_system_prompt = SYSTEM_PROMPT
-        if knowledge_base:
-            full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
-            
-        # Get chat history (up to last 4 turns)
-        history = get_chat_history_for_gemini(user_id, limit=4)
-        # Construct Gemini API contents
-        gemini_contents = history + [
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_message)]
-            )
-        ]
-        
-        max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 1500))
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=gemini_contents,
-            config=types.GenerateContentConfig(
-                system_instruction=full_system_prompt,
-                max_output_tokens=max_tokens,
-                response_mime_type="application/json",
-                response_schema=LegalResponse,
-            ),
-        )
-        
-        try:
-            response_json = json.loads(response.text)
-            is_legal_question = response_json.get("is_legal_question", True)
-            summary = response_json.get("summary", "")
-            full = response_json.get("full", "")
-            sources = response_json.get("sources", [])
-            if not isinstance(sources, list):
-                sources = []
-            
-            if not summary or not full:
-                raise ValueError("JSON missing summary or full key")
-            
-            # Filter and format sources
-            formatted_sources = []
-            for item in sources:
-                if isinstance(item, dict):
-                    title = item.get("title", "")
-                    url = item.get("url", "")
-                else:
-                    title = getattr(item, "title", "")
-                    url = getattr(item, "url", "")
-                
-                if title and url:
-                    # Clean up URL format
-                    url = url.strip()
-                    if not (url.startswith("http://") or url.startswith("https://")):
-                        url = "https://" + url
-                    formatted_sources.append(f"- {title}\n  🔗 {url}")
-            
-            if formatted_sources:
-                sources_text = "\n\n🌐 แหล่งอ้างอิงของรัฐบาล/กฎหมาย:\n" + "\n".join(formatted_sources)
-                summary += sources_text
-                full += sources_text
-                
-        except (json.JSONDecodeError, ValueError) as json_err:
-            logger.warning(f"Failed to parse Gemini JSON: {json_err}. Falling back to regex extraction.")
-            # Use regex to extract summary and full answer from truncated or malformed JSON
-            import re
-            is_legal_match = re.search(r'"is_legal_question"\s*:\s*(true|false)', response.text, re.IGNORECASE)
-            is_legal_question = False if (is_legal_match and is_legal_match.group(1).lower() == 'false') else True
-            summary_match = re.search(r'"summary"\s*:\s*"(.*?)"', response.text, re.DOTALL)
-            full_match = re.search(r'"full"\s*:\s*"(.*?)"', response.text, re.DOTALL)
-            
-            if summary_match or full_match:
-                try:
-                    summary = summary_match.group(1).encode().decode('unicode-escape', errors='ignore') if summary_match else ""
-                except Exception:
-                    summary = summary_match.group(1) if summary_match else ""
-                    
-                try:
-                    full = full_match.group(1).encode().decode('unicode-escape', errors='ignore') if full_match else ""
-                except Exception:
-                    full = full_match.group(1) if full_match else ""
-                
-                # Replace escaped newlines and double quotes
-                summary = summary.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-                full = full.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-            else:
-                summary = ""
-                full = ""
-
-            if not summary or not full:
-                # If regex fails completely, fall back to raw text stripping JSON structure
-                full = response.text
-                summary = (full[:400] + "...\n\n(นี่คือคำตอบย่อ กรุณากดปุ่มด้านล่างเพื่อดูคำตอบเต็ม)") if len(full) > 400 else full
-
-        # Cache the full response in database
-        cache_full_response(user_id, full)
-        
-        # Save user query and assistant response to chat history
-        add_chat_turn(user_id, "user", user_message)
-        add_chat_turn(user_id, "model", summary)
-
-        # Create quick reply for the summary response
-        if is_legal_question:
-            reply_items = [
-                QuickReplyButton(action=PostbackAction(
-                    label="📖 อ่านคำตอบแบบเต็ม",
-                    data="action=show_full"
-                ))
-            ]
-            reply_items.extend(QUICK_REPLIES.items)
-            summary_quick_reply = QuickReply(items=reply_items)
-        else:
-            summary_quick_reply = QUICK_REPLIES
-
-        send_split_messages(event.reply_token, summary, summary_quick_reply)
-
-    except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(
-                    text="ขออภัยครับ ขณะนี้ระบบประมวลผลขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง",
-                    quick_reply=QUICK_REPLIES
-                )]
-            )
-        except Exception as e_reply:
-            logger.error(f"Failed to reply error message: {e_reply}")
+    executor.submit(process_message_async, event)
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
