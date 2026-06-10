@@ -802,6 +802,15 @@ def webhook():
 @handler.add(FollowEvent)
 def handle_follow(event):
     try:
+        user_id = event.source.user_id
+        if user_id:
+            clear_chat_history(user_id)
+            clear_user_state(user_id)
+            logger.info(f"Cleared chat history and user state for follow/unblock event of user: {user_id}")
+    except Exception as e:
+        logger.error(f"Error clearing history on follow event: {e}")
+
+    try:
         line_bot_api.reply_message(
             event.reply_token,
             [TextSendMessage(
@@ -1054,12 +1063,14 @@ def process_message_async(event):
                 
                 if summary_match or full_match:
                     try:
-                        summary = summary_match.group(1).encode().decode('unicode-escape', errors='ignore') if summary_match else ""
+                        # Decode using raw_unicode_escape and unicode-escape to prevent corrupting Thai text (Mojibake)
+                        summary = summary_match.group(1).encode('raw_unicode_escape').decode('unicode-escape', errors='ignore') if summary_match else ""
                     except Exception:
                         summary = summary_match.group(1) if summary_match else ""
                         
                     try:
-                        full = full_match.group(1).encode().decode('unicode-escape', errors='ignore') if full_match else ""
+                        # Decode using raw_unicode_escape and unicode-escape to prevent corrupting Thai text (Mojibake)
+                        full = full_match.group(1).encode('raw_unicode_escape').decode('unicode-escape', errors='ignore') if full_match else ""
                     except Exception:
                         full = full_match.group(1) if full_match else ""
                     

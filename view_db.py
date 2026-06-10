@@ -1,5 +1,13 @@
 import os
 import datetime
+import sys
+
+# Reconfigure stdout to use UTF-8 to prevent Windows terminal encoding crashes
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "database.db")
 DATABASE_URL = os.environ.get("DATABASE_URL")
