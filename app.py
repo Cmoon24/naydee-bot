@@ -104,10 +104,18 @@ def init_db():
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS rate_limits (
                     user_id TEXT,
-                    timestamp REAL
+                    timestamp REAL,
+                    tokens INTEGER DEFAULT 0
                 )
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_rate_limits_user_timestamp ON rate_limits(user_id, timestamp)')
+            
+            # Check if tokens column exists in rate_limits
+            cursor.execute("PRAGMA table_info(rate_limits)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if 'tokens' not in columns:
+                logger.info("Migrating rate_limits table to add tokens column...")
+                cursor.execute("ALTER TABLE rate_limits ADD COLUMN tokens INTEGER DEFAULT 0")
             
             # Response cache table
             cursor.execute('''
@@ -265,11 +273,12 @@ def get_quota_status(user_id):
             conn.commit()
             
             cursor.execute(
-                'SELECT timestamp FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
+                'SELECT timestamp, tokens FROM rate_limits WHERE user_id = ? AND timestamp >= ? ORDER BY timestamp ASC',
                 (user_id_hashed, one_day_ago)
             )
             rows = cursor.fetchall()
             timestamps = [row[0] for row in rows]
+            total_tokens = sum(row[1] for row in rows if row[1] is not None)
             
             used = len(timestamps)
             remaining = max(0, RATE_LIMIT_PER_DAY - used)
@@ -287,6 +296,7 @@ def get_quota_status(user_id):
                 'used': used,
                 'limit': RATE_LIMIT_PER_DAY,
                 'remaining': remaining,
+                'total_tokens': total_tokens,
                 'next_reset_timestamp': next_reset_time,
                 'next_reset_in_seconds': next_reset_in_seconds
             }
@@ -294,10 +304,26 @@ def get_quota_status(user_id):
         logger.error(f"Database error in get_quota_status: {e}")
         return None
 
+def update_quota_tokens(user_id, timestamp, tokens):
+    user_id_hashed = hash_user_id(user_id)
+    if not user_id_hashed or not timestamp:
+        return
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE rate_limits SET tokens = ? WHERE user_id = ? AND timestamp = ?',
+                (tokens, user_id_hashed, timestamp)
+            )
+            conn.commit()
+            logger.info(f"Updated tokens ({tokens}) for request at {timestamp}")
+    except Exception as e:
+        logger.error(f"Error updating tokens in rate_limits: {e}")
+
 def is_rate_limited(user_id):
     user_id_hashed = hash_user_id(user_id)
     if not user_id_hashed:
-        return False, ""
+        return False, "", 0.0
         
     now = time.time()
     one_day_ago = now - 86400
@@ -321,22 +347,22 @@ def is_rate_limited(user_id):
                 wait_seconds = next_reset - now
                 wait_str = format_relative_time(wait_seconds)
                 next_reset_str = format_thai_datetime(next_reset)
-                return True, f"ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน ({RATE_LIMIT_PER_DAY} ครั้ง/วัน) แล้ว จะสามารถใช้งานครั้งต่อไปได้ในอีก {wait_str} ({next_reset_str}) 🙏"
+                return True, f"ขออภัยครับ คุณใช้งานครบกำหนดสูงสุดต่อวัน ({RATE_LIMIT_PER_DAY} ครั้ง/วัน) แล้ว จะสามารถใช้งานครั้งต่อไปได้ในอีก {wait_str} ({next_reset_str}) 🙏", 0.0
                 
             # Check minute limit (60 seconds)
             cursor.execute('SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND timestamp >= ?', (user_id_hashed, one_minute_ago))
             minute_count = cursor.fetchone()[0]
             if minute_count >= RATE_LIMIT_PER_MINUTE:
-                return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️"
+                return True, "คุณส่งข้อความเร็วเกินไป กรุณาเว้นช่วงสักครู่แล้วค่อยลองใหม่อีกครั้งครับ ⏱️", 0.0
                 
             # Add current timestamp
-            cursor.execute('INSERT INTO rate_limits (user_id, timestamp) VALUES (?, ?)', (user_id_hashed, now))
+            cursor.execute('INSERT INTO rate_limits (user_id, timestamp, tokens) VALUES (?, ?, 0)', (user_id_hashed, now))
             conn.commit()
     except Exception as e:
         logger.error(f"Database error in is_rate_limited: {e}")
         # Fail-open: if DB fails, allow request but log error
         
-    return False, ""
+    return False, "", now
 
 def cache_full_response(user_id, full_answer):
     user_id = hash_user_id(user_id)
@@ -687,17 +713,19 @@ def process_message_async(event):
                 used = status['used']
                 limit = status['limit']
                 remaining = status['remaining']
+                total_tokens = status['total_tokens']
                 
                 msg = "📊 *สถานะการใช้งานโควต้าของคุณ*\n\n"
                 msg += f"• ใช้งานไปแล้ว: {used} / {limit} ครั้ง\n"
                 msg += f"• คงเหลือ: {remaining} ครั้ง\n"
+                msg += f"• ปริมาณ Token ที่ใช้: {total_tokens:,} tokens\n\n"
                 
                 if used > 0:
                     next_reset = status['next_reset_timestamp']
                     wait_seconds = next_reset - time.time()
                     wait_str = format_relative_time(wait_seconds)
                     next_reset_str = format_thai_datetime(next_reset)
-                    msg += f"• โควต้าถัดไปจะคืนสิทธิ์ในอีก: {wait_str}\n  ({next_reset_str})"
+                    msg += f"⏱️ *โควต้าถัดไปจะคืนสิทธิ์ในอีก:*\n  {wait_str} ({next_reset_str})"
                 else:
                     msg += "• โควต้าเต็ม: สามารถใช้งานได้ทันที"
             else:
@@ -732,7 +760,7 @@ def process_message_async(event):
             return
 
         # Check rate limits per user to prevent API spam and save token billing
-        limited, limit_message = is_rate_limited(user_id)
+        limited, limit_message, req_timestamp = is_rate_limited(user_id)
         if limited:
             try:
                 line_bot_api.reply_message(
@@ -774,6 +802,11 @@ def process_message_async(event):
                     response_schema=LegalResponse,
                 ),
             )
+            
+            # Record the tokens used in the rate_limits table
+            total_tokens = getattr(response.usage_metadata, 'total_token_count', 0) if response.usage_metadata else 0
+            if total_tokens > 0:
+                update_quota_tokens(user_id, req_timestamp, total_tokens)
             
             try:
                 response_json = json.loads(response.text)
