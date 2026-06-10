@@ -546,6 +546,22 @@ def process_message_async(event):
         # 1. Check if user is currently in the feedback state
         state = get_user_state(user_id)
         if state == "WAITING_FOR_FEEDBACK":
+            # Check if user wants to cancel sending feedback
+            cancel_keywords = ["ยกเลิก", "cancel", "ออก", "exit", "หยุด"]
+            if user_message.strip().lower() in cancel_keywords:
+                clear_user_state(user_id)
+                try:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        [TextSendMessage(
+                            text="ยกเลิกการส่งข้อเสนอแนะแล้วครับ หากมีเรื่องสอบถามเกี่ยวกับกฎหมาย สามารถพิมพ์ถามได้เลยครับ 🙏",
+                            quick_reply=QUICK_REPLIES
+                        )]
+                    )
+                except Exception as e:
+                    logger.error(f"Line Reply Feedback Cancel Error: {e}")
+                return
+
             save_feedback(user_id, user_message)
             clear_user_state(user_id)
             try:
@@ -564,11 +580,18 @@ def process_message_async(event):
         feedback_keywords = ["แจ้งปัญหา", "รายงานปัญหา", "feedback", "ติชม", "ส่งข้อเสนอแนะ"]
         if any(keyword in user_message.lower() for keyword in feedback_keywords):
             set_user_state(user_id, "WAITING_FOR_FEEDBACK")
+            cancel_quick_reply = QuickReply(items=[
+                QuickReplyButton(action=MessageAction(
+                    label="❌ ยกเลิก",
+                    text="ยกเลิก"
+                ))
+            ])
             try:
                 line_bot_api.reply_message(
                     event.reply_token,
                     [TextSendMessage(
-                        text="กรุณาพิมพ์ปัญหาการใช้งาน หรือข้อเสนอแนะที่ต้องการแจ้งได้เลยครับ (ส่งข้อความถัดไปมาได้เลยครับ) 📝"
+                        text="กรุณาพิมพ์ปัญหาการใช้งาน หรือข้อเสนอแนะที่ต้องการแจ้งได้เลยครับ (ส่งข้อความถัดไปมาได้เลยครับ) 📝\n\n(หรือกดปุ่มด้านล่างเพื่อยกเลิก)",
+                        quick_reply=cancel_quick_reply
                     )]
                 )
             except Exception as e:
