@@ -3,7 +3,8 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     QuickReply, QuickReplyButton, MessageAction,
-    FollowEvent, PostbackEvent, PostbackAction
+    FollowEvent, PostbackEvent, PostbackAction,
+    UnfollowEvent
 )
 from linebot.exceptions import InvalidSignatureError
 from google import genai
@@ -821,6 +822,17 @@ def handle_follow(event):
     except Exception as e:
         logger.error(f"Line Reply Follow Error: {e}")
 
+@handler.add(UnfollowEvent)
+def handle_unfollow(event):
+    try:
+        user_id = event.source.user_id
+        if user_id:
+            clear_chat_history(user_id)
+            clear_user_state(user_id)
+            logger.info(f"Cleared chat history and user state for unfollow/block event of user: {user_id}")
+    except Exception as e:
+        logger.error(f"Error clearing history on unfollow event: {e}")
+
 executor = ThreadPoolExecutor(max_workers=20)
 
 def process_message_async(event):
@@ -920,6 +932,23 @@ def process_message_async(event):
                 )
             except Exception as e:
                 logger.error(f"Line Reply Quota Status Error: {e}")
+            return
+
+        # 4. ปุ่มและคำสั่งสำหรับล้างประวัติการคุยแชทด้วยตัวเอง
+        reset_keywords = ["ล้างประวัติ", "ลบประวัติ", "ล้างแชท", "ลบแชท", "/reset", "reset", "clear", "clear history"]
+        if any(keyword in user_message.lower().strip() for keyword in reset_keywords):
+            clear_chat_history(user_id)
+            clear_user_state(user_id)
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ล้างประวัติการสนทนาของท่านเรียบร้อยแล้วครับ เริ่มต้นถามคำถามใหม่ได้เลยครับ! 🧹✨",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Reset History Error: {e}")
             return
 
         # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting
@@ -1077,6 +1106,12 @@ def process_message_async(event):
                     # Replace escaped newlines and double quotes
                     summary = summary.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
                     full = full.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+
+                    # หากตัวใดตัวหนึ่งหายไป ให้ใช้อีกตัวแทนเพื่อป้องกันข้อความเปล่าหรือส่งข้อความ JSON ดิบ
+                    if summary and not full:
+                        full = summary
+                    elif full and not summary:
+                        summary = (full[:400] + "...\n\n(นี่คือคำตอบย่อ กรุณากดปุ่มด้านล่างเพื่อดูคำตอบเต็ม)") if len(full) > 400 else full
                 else:
                     summary = ""
                     full = ""
