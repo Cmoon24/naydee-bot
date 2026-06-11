@@ -1,7 +1,7 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
+    MessageEvent, TextMessage, ImageMessage, TextSendMessage,
     QuickReply, QuickReplyButton, MessageAction,
     FollowEvent, PostbackEvent, PostbackAction,
     UnfollowEvent
@@ -1266,6 +1266,159 @@ def process_message_async(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     executor.submit(process_message_async, event)
+
+IMAGE_ANALYSIS_PROMPT = """ผู้ใช้ส่งรูปภาพนี้มาเพื่อปรึกษาปัญหากฎหมาย กรุณาวิเคราะห์เนื้อหาในรูปภาพ (เช่น เอกสาร สัญญา ข้อความแชท ใบเสร็จ หลักฐาน ฯลฯ) แล้วให้คำแนะนำด้านกฎหมายไทยที่เกี่ยวข้อง
+หากรูปภาพไม่เกี่ยวข้องกับกฎหมายหรือไม่ชัดเจน ให้ตอบปฏิเสธอย่างสุภาพ"""
+
+MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
+
+def process_image_async(event):
+    """Process image messages: download from LINE, send to Gemini vision, reply with legal analysis."""
+    try:
+        user_id = event.source.user_id
+        message_id = event.message.id
+
+        # Check rate limits (shared with text messages)
+        limited, limit_message, req_timestamp = is_rate_limited(user_id)
+        if limited:
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(text=limit_message)]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Rate Limit Error (image): {e}")
+            return
+
+        # Download image content from LINE
+        try:
+            message_content = line_bot_api.get_message_content(message_id)
+            image_bytes = b''
+            for chunk in message_content.iter_content():
+                image_bytes += chunk
+                # Check size limit while downloading to fail fast
+                if len(image_bytes) > MAX_IMAGE_SIZE_BYTES:
+                    try:
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            [TextSendMessage(
+                                text="ขออภัยครับ รูปภาพมีขนาดใหญ่เกินไป (สูงสุด 5MB) กรุณาส่งรูปที่มีขนาดเล็กกว่านี้ครับ 🙏",
+                                quick_reply=QUICK_REPLIES
+                            )]
+                        )
+                    except Exception as e:
+                        logger.error(f"Line Reply Image Size Error: {e}")
+                    return
+        except Exception as e:
+            logger.error(f"Error downloading image from LINE: {e}")
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ขออภัยครับ ไม่สามารถดาวน์โหลดรูปภาพได้ กรุณาลองส่งใหม่อีกครั้งครับ 🙏",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e_reply:
+                logger.error(f"Failed to reply download error: {e_reply}")
+            return
+
+        logger.info(f"Downloaded image from user, size: {len(image_bytes)} bytes")
+
+        # Determine MIME type (LINE sends JPEG by default)
+        content_type = getattr(message_content, 'content_type', 'image/jpeg') or 'image/jpeg'
+
+        try:
+            # Use preloaded knowledge base
+            knowledge_base = load_obsidian_knowledge(OBSIDIAN_VAULT_PATH)
+
+            # Combine system instruction with knowledge base
+            full_system_prompt = SYSTEM_PROMPT
+            if knowledge_base:
+                full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
+
+            # Build multimodal content: image + text prompt
+            gemini_contents = [
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=content_type),
+                        types.Part.from_text(text=IMAGE_ANALYSIS_PROMPT),
+                    ]
+                )
+            ]
+
+            max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 3000))
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=gemini_contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=full_system_prompt,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                    response_schema=LegalResponse,
+                ),
+            )
+
+            # Record the tokens used in the rate_limits table
+            total_tokens = getattr(response.usage_metadata, 'total_token_count', 0) if response.usage_metadata else 0
+            if total_tokens > 0:
+                update_quota_tokens(user_id, req_timestamp, total_tokens)
+
+            # Parse response
+            is_legal_question, summary, full, sources = parse_gemini_response(response.text)
+
+            # Format and append sources
+            formatted_sources = []
+            for s in sources:
+                formatted_sources.append(f"- {s['title']}\n  🔗 {s['url']}")
+
+            if formatted_sources:
+                sources_text = "\n\n🌐 แหล่งอ้างอิงของรัฐบาล/กฎหมาย:\n" + "\n".join(formatted_sources)
+                summary += sources_text
+                full += sources_text
+
+            # Cache the full response
+            cache_full_response(user_id, full)
+
+            # Save to chat history (text description only, not image bytes)
+            add_chat_turn(user_id, "user", "[ผู้ใช้ส่งรูปภาพเพื่อปรึกษากฎหมาย]")
+            add_chat_turn(user_id, "model", summary)
+
+            # Create quick reply for the summary response
+            if is_legal_question:
+                reply_items = [
+                    QuickReplyButton(action=PostbackAction(
+                        label="📖 อ่านคำตอบแบบเต็ม",
+                        data="action=show_full"
+                    ))
+                ]
+                reply_items.extend(QUICK_REPLIES.items)
+                summary_quick_reply = QuickReply(items=reply_items)
+            else:
+                summary_quick_reply = QUICK_REPLIES
+
+            send_split_messages(event.reply_token, summary, summary_quick_reply)
+
+        except Exception as e:
+            logger.error(f"Gemini API Error (image): {e}")
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ขออภัยครับ ขณะนี้ระบบประมวลผลรูปภาพขัดข้อง กรุณาลองใหม่อีกครั้งในภายหลัง หรือลองพิมพ์คำถามเป็นข้อความแทนครับ 🙏",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e_reply:
+                logger.error(f"Failed to reply image error message: {e_reply}")
+    except Exception as ex:
+        logger.error(f"Error in process_image_async: {ex}")
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    executor.submit(process_image_async, event)
+
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
