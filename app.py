@@ -887,6 +887,15 @@ def sanitize_url(url):
         logger.error(f"Error sanitizing URL {url}: {e}")
         return "https://www.krisdika.go.th"
 
+def unescape_json_string(s):
+    """Unescape JSON string escape sequences without breaking UTF-8."""
+    s = s.replace('\\n', '\n')
+    s = s.replace('\\t', '\t')
+    s = s.replace('\\"', '"')
+    s = s.replace('\\/', '/')
+    s = s.replace('\\\\', '\\')
+    return s
+
 def parse_gemini_response(response_text):
     """
     Robustly parses Gemini response. Strips markdown fences, parses JSON,
@@ -942,10 +951,7 @@ def parse_gemini_response(response_text):
     # Escape-aware regex for summary
     summary_match = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
     if summary_match:
-        try:
-            summary = summary_match.group(1).encode('raw_unicode_escape').decode('unicode-escape', errors='ignore')
-        except Exception:
-            summary = summary_match.group(1)
+        summary = unescape_json_string(summary_match.group(1))
     else:
         # Fallback for truncated/unclosed summary string
         trunc_summary = re.search(r'"summary"\s*:\s*"(.*)', raw_text, re.DOTALL)
@@ -959,10 +965,7 @@ def parse_gemini_response(response_text):
     # Escape-aware regex for full
     full_match = re.search(r'"full"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text, re.DOTALL)
     if full_match:
-        try:
-            full = full_match.group(1).encode('raw_unicode_escape').decode('unicode-escape', errors='ignore')
-        except Exception:
-            full = full_match.group(1)
+        full = unescape_json_string(full_match.group(1))
     else:
         # Fallback for truncated/unclosed full string
         trunc_full = re.search(r'"full"\s*:\s*"(.*)', raw_text, re.DOTALL)
@@ -978,17 +981,11 @@ def parse_gemini_response(response_text):
     if sources_section:
         items = re.findall(r'\{\s*"title"\s*:\s*"(.*?)"\s*,\s*"url"\s*:\s*"(.*?)"\s*\}', sources_section.group(1), re.DOTALL)
         for title_raw, url_raw in items:
-            try:
-                title = title_raw.encode('raw_unicode_escape').decode('unicode-escape', errors='ignore')
-                url = url_raw.encode('raw_unicode_escape').decode('unicode-escape', errors='ignore')
-            except Exception:
-                title = title_raw
-                url = url_raw
+            title = unescape_json_string(title_raw)
+            url = unescape_json_string(url_raw)
             sources.append({"title": title.strip(), "url": sanitize_url(url.strip())})
             
-    # Clean up backslashes and escaped quotes
-    summary = summary.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-    full = full.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+    # Note: unescape_json_string() already handles JSON escape sequences above
     
     # Final fallback if both are completely empty or regex failed (prevent raw JSON bubbles)
     if not summary and not full:
