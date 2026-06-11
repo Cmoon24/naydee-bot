@@ -224,6 +224,14 @@ def init_db():
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_qa_cache_user_question ON qa_cache(user_id, question)')
             
+            # Purge any stale cache entries containing raw JSON (starting with '{')
+            try:
+                cursor.execute("DELETE FROM qa_cache WHERE summary LIKE '{%' OR full_answer LIKE '{%'")
+                cursor.execute("DELETE FROM response_cache WHERE full_answer LIKE '{%'")
+                logger.info("Stale JSON cache entries purged successfully.")
+            except Exception as cache_err:
+                logger.error(f"Error purging stale cache entries: {cache_err}")
+            
             conn.commit()
             logger.info("Database initialized successfully.")
         if not DATABASE_URL:
