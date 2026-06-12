@@ -879,19 +879,34 @@ def clear_user_state(user_id):
         logger.error(f"Database error in clear_user_state: {e}")
 
 def clear_user_caches(user_id):
-    """Clear QA cache and response cache for a specific user."""
+    """Clear response cache for a specific user (QA cache is preserved to save daily quota)."""
     user_id_hashed = hash_user_id(user_id)
     if not user_id_hashed:
         return
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            execute_sql(cursor, 'DELETE FROM qa_cache WHERE user_id = %s', (user_id_hashed,))
             execute_sql(cursor, 'DELETE FROM response_cache WHERE user_id = %s', (user_id_hashed,))
             conn.commit()
-            logger.info(f"Cleared QA cache and response cache for user: {user_id_hashed}")
+            logger.info(f"Cleared response cache for user: {user_id_hashed}")
     except Exception as e:
         logger.error(f"Database error in clear_user_caches: {e}")
+
+def force_clear_qa_cache(user_id):
+    """Explicitly delete QA cache for a user to force fresh Gemini API calls."""
+    user_id_hashed = hash_user_id(user_id)
+    if not user_id_hashed:
+        return False
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            execute_sql(cursor, 'DELETE FROM qa_cache WHERE user_id = %s', (user_id_hashed,))
+            conn.commit()
+            logger.info(f"Force cleared QA cache for user: {user_id_hashed}")
+            return True
+    except Exception as e:
+        logger.error(f"Database error in force_clear_qa_cache: {e}")
+        return False
 
 def save_feedback(user_id, feedback_text):
     user_id = hash_user_id(user_id)
@@ -973,11 +988,12 @@ WELCOME_MESSAGE = """สวัสดีครับ! ผม Moon 👋
 
 พิมพ์ปัญหาของคุณได้เลย หรือเลือกหัวข้อที่เจอบ่อยด้านล่างครับ 👇"""
 
-def send_split_messages(reply_token, text, quick_reply=None):
+def send_split_messages(reply_token, text, quick_reply=None, user_id=None):
     """
     LINE limits text messages to 5000 characters. 
     Split the response into chunks of 4900 characters and send them.
     The quick reply is attached only to the last chunk.
+    Falls back to push_message if reply token has expired (common on slow OCR + Gemini calls).
     """
     try:
         limit = 4900
@@ -989,9 +1005,18 @@ def send_split_messages(reply_token, text, quick_reply=None):
             else:
                 messages.append(TextSendMessage(text=chunk))
         
-        line_bot_api.reply_message(reply_token, messages)
+        try:
+            line_bot_api.reply_message(reply_token, messages)
+            logger.info("Successfully sent messages via reply_message")
+        except Exception as reply_err:
+            logger.warning(f"reply_message failed (likely token expired): {reply_err}. Attempting push_message fallback...")
+            if user_id:
+                line_bot_api.push_message(user_id, messages)
+                logger.info("Successfully sent messages via push_message fallback")
+            else:
+                raise
     except Exception as e:
-        logger.error(f"Line Reply Error: {e}")
+        logger.error(f"Line Send Error: {e}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1376,6 +1401,22 @@ def process_message_async(event):
                 logger.error(f"Line Reply New Chat Error: {e}")
             return
 
+        # 6. เคลียร์ QA Cache อย่างชัดแจ้ง (สำหรับทดสอบคำถามเดิมโดยไม่ติด Cache)
+        clear_cache_keywords = ["ล้างแคช", "เคลียร์แคช", "ลบแคช", "/clearcache", "clear cache", "reset cache"]
+        if any(keyword in user_message.lower().strip() for keyword in clear_cache_keywords):
+            force_clear_qa_cache(user_id)
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(
+                        text="ล้างแคชคำถาม-คำตอบ (QA Cache) ของคุณเรียบร้อยแล้วครับ คำถามถัดไปของคุณจะทำการส่งตรงไปยัง Gemini API ทันที 🧹✨",
+                        quick_reply=QUICK_REPLIES
+                    )]
+                )
+            except Exception as e:
+                logger.error(f"Line Reply Clear Cache Error: {e}")
+            return
+
         # Welcome message เมื่อพิมพ์ครั้งแรกหรือ greeting (Exact Match เพื่อเลี่ยงปัญหาชนกับคำในประโยคคำถาม)
         greetings = ["สวัสดี", "สวัสดีครับ", "สวัสดีค่ะ", "หวัดดี", "hello", "hi", "เริ่ม", "start", "เริ่มแชท", "เริ่มแชทใหม่"]
         cleaned_msg = user_message.lower().strip()
@@ -1433,7 +1474,7 @@ def process_message_async(event):
             else:
                 summary_quick_reply = QUICK_REPLIES
                 
-            send_split_messages(event.reply_token, summary, summary_quick_reply)
+            send_split_messages(event.reply_token, summary, summary_quick_reply, user_id=user_id)
             return
 
         try:
@@ -1503,7 +1544,7 @@ def process_message_async(event):
             else:
                 summary_quick_reply = QUICK_REPLIES
     
-            send_split_messages(event.reply_token, summary, summary_quick_reply)
+            send_split_messages(event.reply_token, summary, summary_quick_reply, user_id=user_id)
     
         except Exception as e:
             logger.error(f"Gemini API Error: {e}")
@@ -1678,7 +1719,7 @@ def process_image_async(event):
             else:
                 summary_quick_reply = QUICK_REPLIES
 
-            send_split_messages(event.reply_token, summary, summary_quick_reply)
+            send_split_messages(event.reply_token, summary, summary_quick_reply, user_id=user_id)
 
         except Exception as e:
             logger.error(f"Gemini API Error (image): {e}")
@@ -1708,7 +1749,7 @@ def handle_postback(event):
     if data == "action=show_full":
         full_answer = get_cached_response(user_id)
         if full_answer:
-            send_split_messages(event.reply_token, full_answer, QUICK_REPLIES)
+            send_split_messages(event.reply_token, full_answer, QUICK_REPLIES, user_id=user_id)
         else:
             try:
                 line_bot_api.reply_message(
