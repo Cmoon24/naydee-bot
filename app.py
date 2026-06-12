@@ -402,6 +402,43 @@ def call_gemini_with_fallback(gemini_contents, full_system_prompt, max_tokens, r
     # All models exhausted
     raise last_exception or Exception("All Gemini models exhausted")
 
+def perform_gemini_ocr(image_bytes, mime_type):
+    """
+    Perform OCR on the image using Gemini API.
+    Tries gemini-2.5-flash-lite first, falls back to gemini-2.5-flash if rate-limited or fails.
+    Returns extracted text if found, or None if empty/fails.
+    """
+    ocr_prompt = "กรุณาอ่านและแกะตัวอักษรหรือข้อความภาษาไทยและอังกฤษทั้งหมดที่ปรากฏในรูปภาพนี้ออกมาเป็นข้อความตัวอักษรดิบธรรมดาอย่างถูกต้อง ครบถ้วนที่สุด โดยให้จัดรูปแบบการเว้นวรรคและการขึ้นบรรทัดใหม่ให้ใกล้เคียงกับต้นฉบับมากที่สุด ห้ามสรุปหรือวิเคราะห์ใดๆ และหากไม่มีข้อความในรูปภาพเลย หรืออ่านไม่ได้เลย ให้ตอบสั้นๆ เพียงคำว่า [ไม่มีข้อความ] เท่านั้น"
+    
+    for model_name in ['gemini-2.5-flash-lite', 'gemini-2.5-flash']:
+        try:
+            logger.info(f"Performing OCR text extraction using model: {model_name}...")
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    ocr_prompt
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=2000,
+                )
+            )
+            extracted_text = response.text.strip() if response.text else ""
+            if extracted_text and extracted_text != "[ไม่มีข้อความ]":
+                extracted_text = re.sub(r'^```[a-zA-Z]*\n?', '', extracted_text)
+                extracted_text = re.sub(r'\n?```$', '', extracted_text)
+                extracted_text = extracted_text.strip()
+                logger.info(f"Successfully extracted {len(extracted_text)} characters of text from image via {model_name}")
+                return extracted_text
+            else:
+                logger.info(f"OCR model {model_name} returned no text contents.")
+                return None
+        except Exception as e:
+            logger.warning(f"OCR attempt with {model_name} failed: {e}")
+            time.sleep(1)
+            continue
+    return None
+
 class SourceItem(BaseModel):
     title: str = Field(description="ชื่อกฎหมาย มาตรา หรือชื่อหน่วยงานรัฐบาลที่เป็นแหล่งอ้างอิง เช่น พระราชบัญญัติการทวงถามหนี้ พ.ศ. 2558, เว็บไซต์กรมบังคับคดี")
     url: str = Field(description="ลิงก์ URL อ้างอิงตรงที่ถูกต้องและเข้าใช้งานได้จริง (ต้องเป็นเว็บของรัฐบาล เช่น .go.th หรือแหล่งข้อมูลกฎหมายของทางการ เช่น krisdika.go.th, led.go.th เท่านั้น)")
@@ -1549,6 +1586,9 @@ def process_image_async(event):
         content_type = getattr(message_content, 'content_type', 'image/jpeg') or 'image/jpeg'
 
         try:
+            # 1. Perform OCR text extraction
+            extracted_text = perform_gemini_ocr(image_bytes, content_type)
+            
             # Use preloaded knowledge base
             knowledge_base = load_obsidian_knowledge(OBSIDIAN_VAULT_PATH)
 
@@ -1557,18 +1597,43 @@ def process_image_async(event):
             if knowledge_base:
                 full_system_prompt += f"\n\nนี่คือฐานข้อมูลอ้างอิงความรู้และกฎหมายเพิ่มเติมในระบบของคุณ (กรุณาใช้ข้อมูลและระบุแหล่งอ้างอิงเอกสารเหล่านี้เป็นหลักในการตอบผู้ใช้):\n{knowledge_base}"
 
-            # Build multimodal content: image + text prompt
-            gemini_contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_bytes(data=image_bytes, mime_type=content_type),
-                        types.Part.from_text(text=IMAGE_ANALYSIS_PROMPT),
-                    ]
-                )
-            ]
-
             max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 3000))
+            
+            # Determine prompt contents and history log message
+            if extracted_text:
+                logger.info(f"Using OCR extracted text flow. Length: {len(extracted_text)}")
+                
+                # Fetch chat history for context
+                history = get_chat_history_for_gemini(user_id, limit=4)
+                
+                # Construct Gemini API contents: history + OCR prompt
+                ocr_prompt = f"นี่คือข้อความที่สแกนได้จากรูปภาพปัญหากฎหมายที่ผู้ใช้ส่งเข้ามา เพื่อขอรับคำปรึกษา:\n\n{extracted_text}\n\nกรุณาวิเคราะห์เนื้อหาข้อความตามประเด็นกฎหมายไทย ให้คำแนะนำและวางแนวทางปฏิบัติที่ชัดเจน..."
+                gemini_contents = history + [
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=ocr_prompt)]
+                    )
+                ]
+                
+                # Save to history with extracted text content
+                history_user_msg = f"[ส่งรูปภาพเอกสารสแกนได้ข้อความ]:\n{extracted_text}"
+            else:
+                logger.info("No text detected. Falling back to multimodal vision flow.")
+                
+                # Multimodal vision does not easily mix with multi-turn chat history because history has text-only parts
+                # So we send the current image directly with the image prompt
+                gemini_contents = [
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=content_type),
+                            types.Part.from_text(text=IMAGE_ANALYSIS_PROMPT),
+                        ]
+                    )
+                ]
+                history_user_msg = "[ส่งรูปภาพประกอบการปรึกษากฎหมาย]"
+
+            # Call Gemini
             response, model_used = call_gemini_with_fallback(
                 gemini_contents=gemini_contents,
                 full_system_prompt=full_system_prompt,
@@ -1597,7 +1662,7 @@ def process_image_async(event):
             cache_full_response(user_id, full)
 
             # Save to chat history (text description only, not image bytes)
-            add_chat_turn(user_id, "user", "[ผู้ใช้ส่งรูปภาพเพื่อปรึกษากฎหมาย]")
+            add_chat_turn(user_id, "user", history_user_msg)
             add_chat_turn(user_id, "model", summary)
 
             # Create quick reply for the summary response
