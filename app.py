@@ -981,6 +981,10 @@ QUICK_REPLIES = QuickReply(items=[
         label="📝 แจ้งปัญหา/ติชมบอท",
         text="แจ้งปัญหาการใช้งาน"
     )),
+    QuickReplyButton(action=MessageAction(
+        label="🧹 ล้างแคชคำตอบ",
+        text="ล้างแคช"
+    )),
 ])
 
 WELCOME_MESSAGE = """สวัสดีครับ! ผม Moon 👋
