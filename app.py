@@ -224,14 +224,14 @@ def init_db():
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_qa_cache_user_question ON qa_cache(user_id, question)')
             
-            # Purge all old/corrupted cache and history entries to ensure clean slate
+            # Purge only expired cache entries (preserve valid cache to save API calls)
             try:
-                cursor.execute("DELETE FROM qa_cache")
-                cursor.execute("DELETE FROM response_cache")
-                cursor.execute("DELETE FROM chat_history")
-                logger.info("All stale cache and chat history entries purged successfully.")
+                now = time.time()
+                cursor.execute("DELETE FROM qa_cache WHERE timestamp < ?", (now - 259200,))  # 3 days
+                cursor.execute("DELETE FROM response_cache WHERE updated_at < ?", (now - 7200,))  # 2 hours
+                logger.info("Expired cache entries cleaned up successfully (valid cache preserved).")
             except Exception as cache_err:
-                logger.error(f"Error purging stale cache entries: {cache_err}")
+                logger.error(f"Error cleaning expired cache entries: {cache_err}")
             
             conn.commit()
             logger.info("Database initialized successfully.")
@@ -302,6 +302,101 @@ load_obsidian_knowledge(OBSIDIAN_VAULT_PATH)
 RATE_LIMIT_PER_MINUTE = 5
 RATE_LIMIT_PER_DAY = 50
 RATE_LIMIT_TOKENS_PER_DAY = int(os.environ.get("RATE_LIMIT_TOKENS_PER_DAY", 100000))
+
+# --- Global API Rate Limiter (across ALL users) ---
+class GlobalAPILimiter:
+    """Tracks total Gemini API calls globally to stay within free-tier limits."""
+    def __init__(self, max_rpm=8, max_rpd=18):
+        self.lock = threading.Lock()
+        self.minute_timestamps = []
+        self.day_timestamps = []
+        self.max_rpm = max_rpm
+        self.max_rpd = max_rpd
+
+    def can_call(self):
+        now = time.time()
+        with self.lock:
+            self.minute_timestamps = [t for t in self.minute_timestamps if now - t < 60]
+            self.day_timestamps = [t for t in self.day_timestamps if now - t < 86400]
+
+            if len(self.day_timestamps) >= self.max_rpd:
+                return False, "Global daily RPD limit reached"
+            if len(self.minute_timestamps) >= self.max_rpm:
+                return False, "Global per-minute RPM limit reached"
+
+            self.minute_timestamps.append(now)
+            self.day_timestamps.append(now)
+            return True, "OK"
+
+    def get_status(self):
+        now = time.time()
+        with self.lock:
+            self.minute_timestamps = [t for t in self.minute_timestamps if now - t < 60]
+            self.day_timestamps = [t for t in self.day_timestamps if now - t < 86400]
+            return {
+                'rpm_used': len(self.minute_timestamps),
+                'rpm_limit': self.max_rpm,
+                'rpd_used': len(self.day_timestamps),
+                'rpd_limit': self.max_rpd,
+            }
+
+global_api_limiter = GlobalAPILimiter(
+    max_rpm=int(os.environ.get("GLOBAL_API_RPM", 8)),
+    max_rpd=int(os.environ.get("GLOBAL_API_RPD", 18))
+)
+
+# --- Model Fallback Chain (each model has its own RPD quota) ---
+MODEL_FALLBACK_CHAIN = [
+    'gemini-2.5-flash-lite',   # Primary: cheapest, 10 RPM / 20 RPD
+    'gemini-2.0-flash',        # Fallback 1: separate quota
+    'gemini-2.5-flash',        # Fallback 2: separate quota
+]
+
+def call_gemini_with_fallback(gemini_contents, full_system_prompt, max_tokens, response_schema=LegalResponse):
+    """
+    Calls Gemini API with model fallback chain and retry on rate limit (429).
+    Returns (response, model_used) on success, raises Exception on total failure.
+    """
+    last_exception = None
+
+    for model_name in MODEL_FALLBACK_CHAIN:
+        # Check global rate limiter before calling
+        can_call, reason = global_api_limiter.can_call()
+        if not can_call:
+            logger.warning(f"Global API limiter blocked call: {reason}")
+            # Still try — the per-model quota might be separate
+
+        for attempt in range(2):  # Max 2 attempts per model (1 retry)
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=gemini_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=full_system_prompt,
+                        max_output_tokens=max_tokens,
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                    ),
+                )
+                logger.info(f"Gemini API success with model: {model_name}")
+                return response, model_name
+            except Exception as e:
+                error_str = str(e)
+                last_exception = e
+                if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    logger.warning(f"Rate limited on {model_name} (attempt {attempt+1}): {e}")
+                    if attempt == 0:
+                        time.sleep(2)  # Brief backoff before retry
+                        continue
+                    else:
+                        logger.warning(f"Exhausted retries on {model_name}, trying next model...")
+                        break  # Move to next model
+                else:
+                    # Non-rate-limit error, raise immediately
+                    raise
+
+    # All models exhausted
+    raise last_exception or Exception("All Gemini models exhausted")
 
 class SourceItem(BaseModel):
     title: str = Field(description="ชื่อกฎหมาย มาตรา หรือชื่อหน่วยงานรัฐบาลที่เป็นแหล่งอ้างอิง เช่น พระราชบัญญัติการทวงถามหนี้ พ.ศ. 2558, เว็บไซต์กรมบังคับคดี")
@@ -1239,15 +1334,10 @@ def process_message_async(event):
             ]
             
             max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 3000))
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=gemini_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=full_system_prompt,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=LegalResponse,
-                ),
+            response, model_used = call_gemini_with_fallback(
+                gemini_contents=gemini_contents,
+                full_system_prompt=full_system_prompt,
+                max_tokens=max_tokens,
             )
             
             # Record the tokens used in the rate_limits table
@@ -1394,15 +1484,10 @@ def process_image_async(event):
             ]
 
             max_tokens = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", 3000))
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=gemini_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=full_system_prompt,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=LegalResponse,
-                ),
+            response, model_used = call_gemini_with_fallback(
+                gemini_contents=gemini_contents,
+                full_system_prompt=full_system_prompt,
+                max_tokens=max_tokens,
             )
 
             # Record the tokens used in the rate_limits table
