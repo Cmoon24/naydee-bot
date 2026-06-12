@@ -224,14 +224,18 @@ def init_db():
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_qa_cache_user_question ON qa_cache(user_id, question)')
             
-            # Purge only expired cache entries (preserve valid cache to save API calls)
+            # Purge expired and corrupt cache entries (preserve valid cache to save API calls)
             try:
                 now = time.time()
-                cursor.execute("DELETE FROM qa_cache WHERE timestamp < ?", (now - 259200,))  # 3 days
-                cursor.execute("DELETE FROM response_cache WHERE updated_at < ?", (now - 7200,))  # 2 hours
-                logger.info("Expired cache entries cleaned up successfully (valid cache preserved).")
+                execute_sql(cursor, "DELETE FROM qa_cache WHERE timestamp < %s", (now - 259200,))  # 3 days
+                execute_sql(cursor, "DELETE FROM response_cache WHERE updated_at < %s", (now - 7200,))  # 2 hours
+                
+                # Delete any dirty cache entries where the summary contains JSON structure
+                execute_sql(cursor, "DELETE FROM qa_cache WHERE summary LIKE %s OR summary LIKE %s", ('%{%', '%"summary"%'))
+                
+                logger.info("Expired and dirty cache entries cleaned up successfully.")
             except Exception as cache_err:
-                logger.error(f"Error cleaning expired cache entries: {cache_err}")
+                logger.error(f"Error cleaning cache entries: {cache_err}")
             
             conn.commit()
             logger.info("Database initialized successfully.")
@@ -433,6 +437,48 @@ def format_thai_datetime(timestamp):
     time_str = dt.strftime("%H:%M")
     return f"{day} {month} {dt.year + 543} เวลา {time_str} น."
 
+def post_process_text(text):
+    """Clean up text before sending to LINE user — remove any residual code/JSON artifacts."""
+    if not text:
+        return ""
+        
+    text = text.strip()
+    
+    # 1. Strip markdown code block fences (```json ... ```)
+    text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+    text = re.sub(r'\n?```$', '', text)
+    text = text.strip()
+    
+    # 2. If the text itself is a JSON object (e.g. nested or leaked JSON)
+    if text.startswith('{') and text.endswith('}'):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # Try to extract the most descriptive text field
+                for key in ['summary', 'full', 'full_answer', 'text', 'message']:
+                    val = data.get(key)
+                    if val and isinstance(val, str):
+                        return post_process_text(val)
+        except Exception:
+            pass
+
+    # 3. Unescape literal escape sequences
+    text = text.replace('\\n', '\n')
+    text = text.replace('\\t', '\t')
+    text = text.replace('\\"', '"')
+    text = text.replace('\\/', '/')
+    text = text.replace('\\\\', '\\')
+    
+    # 4. Remove stray JSON keys that leaked into output (e.g. "summary": ...)
+    text = re.sub(r'^\s*"?(summary|full|is_legal_question|sources)"?\s*:\s*', '', text)
+    
+    # 5. Remove leading/trailing quotes if the entire string is wrapped in them
+    text = text.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+        
+    return text.strip()
+
 def get_quota_status(user_id):
     user_id_hashed = hash_user_id(user_id)
     if not user_id_hashed:
@@ -601,7 +647,7 @@ def get_cached_response(user_id):
             execute_sql(cursor, 'SELECT full_answer FROM response_cache WHERE user_id = %s', (user_id,))
             row = cursor.fetchone()
             if row:
-                return row[0]
+                return post_process_text(row[0])
     except Exception as e:
         logger.error(f"Database error in get_cached_response: {e}")
     return None
@@ -625,8 +671,8 @@ def get_qa_cache(user_id, question):
             row = cursor.fetchone()
             if row:
                 return {
-                    'summary': row[0],
-                    'full_answer': row[1],
+                    'summary': post_process_text(row[0]),
+                    'full_answer': post_process_text(row[1]),
                     'is_legal_question': bool(row[2])
                 }
     except Exception as e:
@@ -1119,24 +1165,7 @@ def parse_gemini_response(response_text):
         
     return is_legal_question, summary, full, sources
 
-def post_process_text(text):
-    """Clean up text before sending to LINE user — remove any residual code/JSON artifacts."""
-    if not text:
-        return ""
-    # Unescape literal \n and \t that survived JSON parsing
-    text = text.replace('\\n', '\n')
-    text = text.replace('\\t', '\t')
-    text = text.replace('\\"', '"')
-    # Strip markdown code block fences (```json ... ```)
-    text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
-    text = re.sub(r'\n?```$', '', text)
-    # Remove stray JSON keys that leaked into output
-    text = re.sub(r'^\s*"?(summary|full|is_legal_question|sources)"?\s*:\s*', '', text)
-    # Remove leading/trailing quotes if the entire string is wrapped in them
-    text = text.strip()
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
-        text = text[1:-1]
-    return text.strip()
+# post_process_text utility is moved up to handle early calls
 
 def extract_gemini_result(response):
     """
