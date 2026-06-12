@@ -1119,6 +1119,62 @@ def parse_gemini_response(response_text):
         
     return is_legal_question, summary, full, sources
 
+def post_process_text(text):
+    """Clean up text before sending to LINE user — remove any residual code/JSON artifacts."""
+    if not text:
+        return ""
+    # Unescape literal \n and \t that survived JSON parsing
+    text = text.replace('\\n', '\n')
+    text = text.replace('\\t', '\t')
+    text = text.replace('\\"', '"')
+    # Strip markdown code block fences (```json ... ```)
+    text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+    text = re.sub(r'\n?```$', '', text)
+    # Remove stray JSON keys that leaked into output
+    text = re.sub(r'^\s*"?(summary|full|is_legal_question|sources)"?\s*:\s*', '', text)
+    # Remove leading/trailing quotes if the entire string is wrapped in them
+    text = text.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+    return text.strip()
+
+def extract_gemini_result(response):
+    """
+    Extract structured result from Gemini response.
+    Priority: response.parsed (Pydantic) > response.text (JSON) > regex fallback.
+    Always post-processes text to remove code/JSON artifacts before sending to user.
+    """
+    # Method 1: Try response.parsed (Pydantic object from structured output)
+    try:
+        parsed = response.parsed
+        if parsed is not None:
+            is_legal_question = getattr(parsed, 'is_legal_question', True)
+            summary = getattr(parsed, 'summary', '')
+            full = getattr(parsed, 'full', '')
+            sources_raw = getattr(parsed, 'sources', [])
+            
+            sources = []
+            if sources_raw:
+                for item in sources_raw:
+                    title = getattr(item, 'title', '') if not isinstance(item, dict) else item.get('title', '')
+                    url = getattr(item, 'url', '') if not isinstance(item, dict) else item.get('url', '')
+                    if title and url:
+                        sources.append({'title': title, 'url': sanitize_url(url)})
+            
+            if summary and full:
+                logger.info("Used response.parsed (Pydantic) for clean extraction")
+                return is_legal_question, post_process_text(summary), post_process_text(full), sources
+    except Exception as e:
+        logger.warning(f"response.parsed failed: {e}")
+    
+    # Method 2: Fallback to text-based parsing
+    try:
+        is_legal_question, summary, full, sources = parse_gemini_response(response.text)
+        return is_legal_question, post_process_text(summary), post_process_text(full), sources
+    except Exception as e:
+        logger.error(f"All parsing methods failed: {e}")
+        return True, "ขออภัยครับ ระบบไม่สามารถประมวลผลคำตอบได้ กรุณาลองใหม่อีกครั้ง 🙏", "", []
+
 def process_message_async(event):
     try:
         user_message = scrub_pii(event.message.text)
@@ -1345,8 +1401,8 @@ def process_message_async(event):
             if total_tokens > 0:
                 update_quota_tokens(user_id, req_timestamp, total_tokens)
             
-            # Robustly parse response (combining JSON and escape-aware regex fallback)
-            is_legal_question, summary, full, sources = parse_gemini_response(response.text)
+            # Robustly parse response (Pydantic first, then JSON/regex fallback)
+            is_legal_question, summary, full, sources = extract_gemini_result(response)
             
             # Format and append sources
             formatted_sources = []
@@ -1495,8 +1551,8 @@ def process_image_async(event):
             if total_tokens > 0:
                 update_quota_tokens(user_id, req_timestamp, total_tokens)
 
-            # Parse response
-            is_legal_question, summary, full, sources = parse_gemini_response(response.text)
+            # Parse response (Pydantic first, then JSON/regex fallback)
+            is_legal_question, summary, full, sources = extract_gemini_result(response)
 
             # Format and append sources
             formatted_sources = []
