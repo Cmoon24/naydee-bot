@@ -349,6 +349,17 @@ global_api_limiter = GlobalAPILimiter(
     max_rpd=int(os.environ.get("GLOBAL_API_RPD", 18))
 )
 
+class SourceItem(BaseModel):
+    title: str = Field(description="ชื่อกฎหมาย มาตรา หรือชื่อหน่วยงานรัฐบาลที่เป็นแหล่งอ้างอิง เช่น พระราชบัญญัติการทวงถามหนี้ พ.ศ. 2558, เว็บไซต์กรมบังคับคดี")
+    url: str = Field(description="ลิงก์ URL อ้างอิงตรงที่ถูกต้องและเข้าใช้งานได้จริง (ต้องเป็นเว็บของรัฐบาล เช่น .go.th หรือแหล่งข้อมูลกฎหมายของทางการ เช่น krisdika.go.th, led.go.th เท่านั้น)")
+
+# Schema for Gemini structured JSON response
+class LegalResponse(BaseModel):
+    is_legal_question: bool = Field(description="ระบุว่าเป็นคำถามที่เกี่ยวข้องกับกฎหมายไทย ความรู้ด้านกฎหมาย คดีความ สิทธิหน้าที่พลเมือง หรือเรื่องร้องเรียนทางกฎหมายหรือไม่ (True/False)")
+    summary: str = Field(description="สรุปคำตอบแบบย่อสั้นๆ กระชับ เข้าใจง่าย บอก action plan ชัดเจนทีละขั้น มี disclaimer ท้ายคำตอบ (หาก is_legal_question เป็น False ให้พิมพ์ปฏิเสธการตอบเรื่องนอกเหนือกฎหมายอย่างสุภาพที่นี่)")
+    full: str = Field(description="รายละเอียดคำตอบแบบเต็ม ครบถ้วนตามข้อกฎหมาย มีขั้นตอนการดำเนินการ และ disclaimer ท้ายคำตอบ (หาก is_legal_question เป็น False ให้พิมพ์ปฏิเสธการตอบเรื่องนอกเหนือกฎหมายอย่างสุภาพที่นี่)")
+    sources: list[SourceItem] = Field(default=[], description="รายการแหล่งอ้างอิงทางกฎหมายหรือหน่วยงานรัฐที่เกี่ยวข้อง (จำกัดไม่เกิน 3 แหล่งอ้างอิง) หาก is_legal_question เป็น False ให้เป็นลิสต์ว่าง")
+
 # --- Model Fallback Chain (each model has its own RPD quota) ---
 MODEL_FALLBACK_CHAIN = [
     'gemini-2.5-flash-lite',   # Primary: cheapest, 10 RPM / 20 RPD
@@ -439,16 +450,7 @@ def perform_gemini_ocr(image_bytes, mime_type):
             continue
     return None
 
-class SourceItem(BaseModel):
-    title: str = Field(description="ชื่อกฎหมาย มาตรา หรือชื่อหน่วยงานรัฐบาลที่เป็นแหล่งอ้างอิง เช่น พระราชบัญญัติการทวงถามหนี้ พ.ศ. 2558, เว็บไซต์กรมบังคับคดี")
-    url: str = Field(description="ลิงก์ URL อ้างอิงตรงที่ถูกต้องและเข้าใช้งานได้จริง (ต้องเป็นเว็บของรัฐบาล เช่น .go.th หรือแหล่งข้อมูลกฎหมายของทางการ เช่น krisdika.go.th, led.go.th เท่านั้น)")
-
-# Schema for Gemini structured JSON response
-class LegalResponse(BaseModel):
-    is_legal_question: bool = Field(description="ระบุว่าเป็นคำถามที่เกี่ยวข้องกับกฎหมายไทย ความรู้ด้านกฎหมาย คดีความ สิทธิหน้าที่พลเมือง หรือเรื่องร้องเรียนทางกฎหมายหรือไม่ (True/False)")
-    summary: str = Field(description="สรุปคำตอบแบบย่อสั้นๆ กระชับ เข้าใจง่าย บอก action plan ชัดเจนทีละขั้น มี disclaimer ท้ายคำตอบ (หาก is_legal_question เป็น False ให้พิมพ์ปฏิเสธการตอบเรื่องนอกเหนือกฎหมายอย่างสุภาพที่นี่)")
-    full: str = Field(description="รายละเอียดคำตอบแบบเต็ม ครบถ้วนตามข้อกฎหมาย มีขั้นตอนการดำเนินการ และ disclaimer ท้ายคำตอบ (หาก is_legal_question เป็น False ให้พิมพ์ปฏิเสธการตอบเรื่องนอกเหนือกฎหมายอย่างสุภาพที่นี่)")
-    sources: list[SourceItem] = Field(default=[], description="รายการแหล่งอ้างอิงทางกฎหมายหรือหน่วยงานรัฐที่เกี่ยวข้อง (จำกัดไม่เกิน 3 แหล่งอ้างอิง) หาก is_legal_question เป็น False ให้เป็นลิสต์ว่าง")
+# Pydantic Response schemas are moved up above to fix NameError in call_gemini_with_fallback
 
 def format_relative_time(seconds):
     if seconds <= 0:
